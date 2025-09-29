@@ -14,14 +14,24 @@ import plotly.graph_objects as go
 # =========================
 # App (title + expose Flask server)
 # =========================
+# App (title + expose Flask server)
+from flask import Response
+
 app = Dash(
     __name__,
     title="CWB Practice Stats",
-    suppress_callback_exceptions=True
+    suppress_callback_exceptions=True,
+    # These two lines make sure Dash’s JS/CSS routes line up on Render
+    requests_pathname_prefix="/",
+    serve_locally=True,   # serve component bundles from this app (not CDN)
 )
 server = app.server
-# Safety placeholder so Render never sees a blank layout at startup
-app.layout = html.Div([html.H1("CWB Practice Stats")])
+
+# tiny health check so we know the Flask layer is alive
+@server.route("/healthz")
+def _healthz():
+    return Response("ok", mimetype="text/plain")
+
 
 # =========================
 # Config
@@ -3988,220 +3998,239 @@ TOOLTIP_CSS_ABOVE = [
     {"selector": ".dash-spreadsheet .cell", "rule": "overflow: visible; position: relative;"}
 ]
 
-# ---- mk5 ADD: layout (no Loading spinners, no timer-based Interval)
-app.layout = html.Div(
-    style={"maxWidth":"1600px","margin":"0 auto","padding":"10px"},
-    children=[
-        # --- Title added ---
-        html.H1(
-            "CWB Practice Stats",
-            style={
-                "textAlign": "center",
-                "margin": "6px 0 12px 0",
-                "fontFamily": "system-ui",
-                "fontWeight": 800,
-                "letterSpacing": "0.3px"
-            }
-        ),
+# ---- mk5 ADD: layout wrapped safely so cloud never renders blank
+import traceback
 
-        html.Div([
-            html.Div(f"Data source: {DATA_PATH}", style={"color":"#666","fontSize":"12px","marginBottom":"2px"}),
-            html.Div("Charts update when data or filters change", style={"color":"#888","fontSize":"10px"}),
-            html.Div(id="status", style={"color":"#888","fontSize":"10px"}),
-        ], style={"textAlign":"center","marginBottom":"8px"}),
+def build_full_layout():
+    return html.Div(
+        style={"maxWidth":"1600px","margin":"0 auto","padding":"10px"},
+        children=[
+            # --- Title added ---
+            html.H1(
+                "CWB Practice Stats",
+                style={
+                    "textAlign": "center",
+                    "margin": "6px 0 12px 0",
+                    "fontFamily": "system-ui",
+                    "fontWeight": 800,
+                    "letterSpacing": "0.3px"
+                }
+            ),
 
-        dcc.Tabs(id="tabs", value="tab_shooting", children=[
-            dcc.Tab(label="Shooting", value="tab_shooting", children=[
-                # ---------- Shooting filters
-                html.Div([
-                    _pill("Practice Date(s)", dcc.DatePickerRange(
-                        id="flt_date_range_shoot",
-                        min_date_allowed=None, max_date_allowed=None,
-                        start_date=None, end_date=None,
-                        minimum_nights=0,
-                        display_format="YYYY-MM-DD",
-                        style={"background":"white"}
-                    )),
-                    _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_shoot","e.g. 3v3 / 5v5")),
-                    _pill("Drill", _mk_multi("Drill","flt_drill_full_shoot","e.g. 5v5 Stags")),
-                    _pill("Shooter", _mk_multi("Shooter","flt_shooter","Filter by shooter")),
-                    _pill("Defender(s)", _mk_multi("Defender(s)","flt_defenders","Who contested the shot")),
-                    _pill("Assister", _mk_multi("Assister","flt_assister","Passer on made FG")),
-                    _pill("Screen Assister", _mk_multi("Screen Assister","flt_screen_assister","Who set the screen")),
-                    _pill("On-Ball Action", dcc.Dropdown(
-                        id="flt_onball", options=ONBALL_OPTIONS, multi=True, placeholder="Select on-ball actions",
-                        style={"minWidth":"200px"}
-                    )),
-                    _pill("Off-Ball Action", dcc.Dropdown(
-                        id="flt_offball", options=OFFBALL_OPTIONS, multi=True, placeholder="Select off-ball actions",
-                        style={"minWidth":"200px"}
-                    )),
-                    _pill("Defense", dcc.Dropdown(
-                        id="flt_defense_shoot", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
-                        style={"minWidth":"140px"}
-                    )),
-                    html.Button("Clear", id="btn_clear_shoot", n_clicks=0,
-                                style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
-                ], style={
-                    "display":"flex","flexWrap":"wrap","gap":"12px",
-                    "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
-                    "borderRadius":"8px","padding":"10px","marginBottom":"10px"
-                }),
+            html.Div([
+                html.Div(f"Data source: {DATA_PATH}", style={"color":"#666","fontSize":"12px","marginBottom":"2px"}),
+                html.Div("Charts update when data or filters change", style={"color":"#888","fontSize":"10px"}),
+                html.Div(id="status", style={"color":"#888","fontSize":"10px"}),
+            ], style={"textAlign":"center","marginBottom":"8px"}),
 
-                # Single row: Stats | Shot Chart | Hot/Cold
-                html.Div([
-                    # --- 1) Shooting Stats (left) ---
+            dcc.Tabs(id="tabs", value="tab_shooting", children=[
+                dcc.Tab(label="Shooting", value="tab_shooting", children=[
+                    # ---------- Shooting filters
                     html.Div([
-                        html.Div("Shooting Stats", style={
-                            "textAlign": "center", "fontSize": "20px", "fontWeight": 700, "marginBottom": "6px"
-                        }),
-                        html.Div(id="shooting_stats_box", style={
-                            "display": "grid", "gridTemplateColumns": "repeat(3, 1fr)", "gap": "10px"
-                        }),
-                    ], style={"width": "300px", "padding": "8px", "border": "1px solid #eee",
-                              "borderRadius": "8px", "background": "white"}),
+                        _pill("Practice Date(s)", dcc.DatePickerRange(
+                            id="flt_date_range_shoot",
+                            min_date_allowed=None, max_date_allowed=None,
+                            start_date=None, end_date=None,
+                            minimum_nights=0,
+                            display_format="YYYY-MM-DD",
+                            style={"background":"white"}
+                        )),
+                        _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_shoot","e.g. 3v3 / 5v5")),
+                        _pill("Drill", _mk_multi("Drill","flt_drill_full_shoot","e.g. 5v5 Stags")),
+                        _pill("Shooter", _mk_multi("Shooter","flt_shooter","Filter by shooter")),
+                        _pill("Defender(s)", _mk_multi("Defender(s)","flt_defenders","Who contested the shot")),
+                        _pill("Assister", _mk_multi("Assister","flt_assister","Passer on made FG")),
+                        _pill("Screen Assister", _mk_multi("Screen Assister","flt_screen_assister","Who set the screen")),
+                        _pill("On-Ball Action", dcc.Dropdown(
+                            id="flt_onball", options=ONBALL_OPTIONS, multi=True, placeholder="Select on-ball actions",
+                            style={"minWidth":"200px"}
+                        )),
+                        _pill("Off-Ball Action", dcc.Dropdown(
+                            id="flt_offball", options=OFFBALL_OPTIONS, multi=True, placeholder="Select off-ball actions",
+                            style={"minWidth":"200px"}
+                        )),
+                        _pill("Defense", dcc.Dropdown(
+                            id="flt_defense_shoot", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
+                            style={"minWidth":"140px"}
+                        )),
+                        html.Button("Clear", id="btn_clear_shoot", n_clicks=0,
+                                    style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
+                    ], style={
+                        "display":"flex","flexWrap":"wrap","gap":"12px",
+                        "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
+                        "borderRadius":"8px","padding":"10px","marginBottom":"10px"
+                    }),
 
-                    # --- 2) Shot Chart (middle) ---
+                    # Single row: Stats | Shot Chart | Hot/Cold
                     html.Div([
-                        html.Div("Shot Chart", style={
-                            "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
-                        }),
-                        dcc.Graph(
-                            id="shot_chart",
-                            config={"displayModeBar": False},
-                            figure=_initial_shot_fig,
-                            animate=False,
-                            clear_on_unhover=False,
-                        ),
+                        # --- 1) Shooting Stats (left) ---
                         html.Div([
-                            html.Span("● Make", style={"color": "green", "marginRight": "20px", "fontWeight": 600}),
-                            html.Span("✖ Miss", style={"color": "red", "fontWeight": 600}),
-                        ], style={"textAlign": "center", "marginTop": "-4px"}),
-                    ], style={"width": "600px"}),
+                            html.Div("Shooting Stats", style={
+                                "textAlign": "center", "fontSize": "20px", "fontWeight": 700, "marginBottom": "6px"
+                            }),
+                            html.Div(id="shooting_stats_box", style={
+                                "display": "grid", "gridTemplateColumns": "repeat(3, 1fr)", "gap": "10px"
+                            }),
+                        ], style={"width": "300px", "padding": "8px", "border": "1px solid #eee",
+                                  "borderRadius": "8px", "background": "white"}),
 
-                    # --- 3) Hot/Cold Zones (right) ---
+                        # --- 2) Shot Chart (middle) ---
+                        html.Div([
+                            html.Div("Shot Chart", style={
+                                "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
+                            }),
+                            dcc.Graph(
+                                id="shot_chart",
+                                config={"displayModeBar": False},
+                                figure=_initial_shot_fig,
+                                animate=False,
+                                clear_on_unhover=False,
+                            ),
+                            html.Div([
+                                html.Span("● Make", style={"fontWeight": 600, "marginRight": "20px", "color": "green"}),
+                                html.Span("✖ Miss", style={"fontWeight": 600, "color": "red"}),
+                            ], style={"textAlign": "center", "marginTop": "-4px"}),
+                        ], style={"width": "600px"}),
+
+                        # --- 3) Hot/Cold Zones (right) ---
+                        html.Div([
+                            html.Div("Hot/Cold Zones", style={
+                                "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
+                            }),
+                            dcc.Graph(
+                                id="zone_chart",
+                                config={"displayModeBar": False},
+                                figure=_initial_zone_fig,
+                                animate=False,
+                                clear_on_unhover=False,
+                            ),
+                            zone_legend_component(),
+                        ], style={"width": "600px"}),
+                    ], id="shooting-row", style={
+                        "display": "grid",
+                        "gridTemplateColumns": "300px 600px 600px",
+                        "columnGap": "20px",
+                        "alignItems": "center",
+                        "justifyContent": "center",
+                        "margin": "0 auto",
+                        "maxWidth": "1600px",
+                        "overflowX": "visible",
+                    }),
+
+                    html.Div(id="shot_details", style={"maxWidth":"920px","margin":"14px auto 0 auto"}),
+                ]),
+
+                dcc.Tab(label="Stats", value="tab_stats", children=[
+                    # ---------- Stats tab filters (subset)
                     html.Div([
-                        html.Div("Hot/Cold Zones", style={
-                            "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
+                        _pill("Practice Date(s)", dcc.DatePickerRange(
+                            id="flt_date_range_stats",
+                            min_date_allowed=None, max_date_allowed=None,
+                            start_date=None, end_date=None,
+                            minimum_nights=0,
+                            display_format="YYYY-MM-DD",
+                            style={"background":"white"}
+                        )),
+                        _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_stats","e.g. 3v3 / 5v5")),
+                        _pill("Drill", _mk_multi("Drill","flt_drill_full_stats","e.g. 5v5 Stags")),
+                        _pill("Defense", dcc.Dropdown(
+                            id="flt_defense_stats", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
+                            style={"minWidth":"140px"}
+                        )),
+                        html.Button("Clear", id="btn_clear_stats", n_clicks=0,
+                                    style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
+                    ], style={
+                        "display":"flex","flexWrap":"wrap","gap":"12px",
+                        "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
+                        "borderRadius":"8px","padding":"10px","marginBottom":"10px"
+                    }),
+
+                    # ---------- Stats table (BASIC)
+                    html.Div([
+                        html.Div("Basic Stats (click headers to sort)", style={
+                            "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
                         }),
-                        dcc.Graph(
-                            id="zone_chart",
-                            config={"displayModeBar": False},
-                            figure=_initial_zone_fig,
-                            animate=False,
-                            clear_on_unhover=False,
+                        dash_table.DataTable(
+                            id=(BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table"),
+                            columns=basic_cols,
+                            data=[],
+                            sort_action="native",
+                            style_table={"overflowX":"auto"},
+                            style_cell={
+                                "fontFamily":"Arial","fontSize":"13px","padding":"6px",
+                                "textAlign":"center","overflow":"visible"
+                            },
+                            style_header={
+                                "fontWeight":"700","backgroundColor":"#f5f5f5",
+                                "cursor":"pointer",
+                                "overflow":"visible",
+                                "textDecoration":"none"
+                            },
+                            tooltip_header=build_header_tooltips(basic_cols),
+                            tooltip_delay=0,
+                            tooltip_duration=None,
+                            fixed_rows={"headers": True},
+                            page_size=50,
+                            css=TOOLTIP_CSS_ABOVE,
                         ),
-                        zone_legend_component(),
-                    ], style={"width": "600px"}),
-                ], id="shooting-row", style={
-                    "display": "grid",
-                    "gridTemplateColumns": "300px 600px 600px",
-                    "columnGap": "20px",
-                    "alignItems": "center",
-                    "justifyContent": "center",
-                    "margin": "0 auto",
-                    "maxWidth": "1600px",
-                    "overflowX": "visible",
-                }),
+                    ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px",
+                              "background":"white","marginBottom":"10px"}),
 
-                html.Div(id="shot_details", style={"maxWidth":"920px","margin":"14px auto 0 auto"}),
+                    # ---------- Advanced Stats table (OP/DP + derived metrics)
+                    html.Div([
+                        html.Div("Advanced Stats (click headers to sort)", style={
+                            "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
+                        }),
+                        dash_table.DataTable(
+                            id="advanced_stats_table",
+                            columns=adv_cols,
+                            data=[],
+                            sort_action="native",
+                            style_table={"overflowX":"auto"},
+                            style_cell={
+                                "fontFamily":"Arial","fontSize":"13px","padding":"6px",
+                                "textAlign":"center","overflow":"visible"
+                            },
+                            style_header={
+                                "fontWeight":"700","backgroundColor":"#f5f5f5",
+                                "cursor":"pointer",
+                                "overflow":"visible",
+                                "textDecoration":"none"
+                            },
+                            tooltip_header=build_header_tooltips(adv_cols),
+                            tooltip_delay=0,
+                            tooltip_duration=None,
+                            fixed_rows={"headers": True},
+                            page_size=50,
+                            css=TOOLTIP_CSS_ABOVE,
+                        ),
+                    ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px","background":"white"}),
+                ]),
             ]),
 
-            dcc.Tab(label="Stats", value="tab_stats", children=[
-                # ---------- Stats tab filters (subset)
-                html.Div([
-                    _pill("Practice Date(s)", dcc.DatePickerRange(
-                        id="flt_date_range_stats",
-                        min_date_allowed=None, max_date_allowed=None,
-                        start_date=None, end_date=None,
-                        minimum_nights=0,
-                        display_format="YYYY-MM-DD",
-                        style={"background":"white"}
-                    )),
-                    _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_stats","e.g. 3v3 / 5v5")),
-                    _pill("Drill", _mk_multi("Drill","flt_drill_full_stats","e.g. 5v5 Stags")),
-                    _pill("Defense", dcc.Dropdown(
-                        id="flt_defense_stats", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
-                        style={"minWidth":"140px"}
-                    )),
-                    html.Button("Clear", id="btn_clear_stats", n_clicks=0,
-                                style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
-                ], style={
-                    "display":"flex","flexWrap":"wrap","gap":"12px",
-                    "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
-                    "borderRadius":"8px","padding":"10px","marginBottom":"10px"
-                }),
+            # ---- state stores (used by callbacks in Sections 6–8)
+            dcc.Store(id="sel_pos", data=[]),
+            dcc.Store(id="filters_shoot_state"),
+            dcc.Store(id="filters_stats_state"),
+            dcc.Store(id="options_cache", data={}),
+        ]
+    )
 
-                # ---------- Stats table (BASIC)
-                html.Div([
-                    html.Div("Basic Stats (click headers to sort)", style={
-                        "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
-                    }),
-                    dash_table.DataTable(
-                        id=(BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table"),
-                        columns=basic_cols,
-                        data=[],
-                        sort_action="native",
-                        style_table={"overflowX":"auto"},
-                        style_cell={
-                            "fontFamily":"Arial","fontSize":"13px","padding":"6px",
-                            "textAlign":"center","overflow":"visible"
-                        },
-                        style_header={
-                            "fontWeight":"700","backgroundColor":"#f5f5f5",
-                            "cursor":"pointer",
-                            "overflow":"visible",
-                            "textDecoration":"none"
-                        },
-                        tooltip_header=build_header_tooltips(basic_cols),
-                        tooltip_delay=0,
-                        tooltip_duration=None,
-                        fixed_rows={"headers": True},
-                        page_size=50,
-                        css=TOOLTIP_CSS_ABOVE,
-                    ),
-                ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px",
-                          "background":"white","marginBottom":"10px"}),
+def safe_layout():
+    try:
+        return build_full_layout()
+    except Exception:
+        tb = traceback.format_exc()
+        print("LAYOUT ERROR:\n", tb)
+        return html.Div([
+            html.H1("CWB Practice Stats"),
+            html.Hr(),
+            html.P("There was an error building the layout. See details below."),
+            html.Pre(tb, style={"whiteSpace":"pre-wrap","fontSize":"12px"})
+        ], style={"padding":"16px"})
 
-                # ---------- Advanced Stats table (OP/DP + derived metrics)
-                html.Div([
-                    html.Div("Advanced Stats (click headers to sort)", style={
-                        "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
-                    }),
-                    dash_table.DataTable(
-                        id="advanced_stats_table",
-                        columns=adv_cols,
-                        data=[],
-                        sort_action="native",
-                        style_table={"overflowX":"auto"},
-                        style_cell={
-                            "fontFamily":"Arial","fontSize":"13px","padding":"6px",
-                            "textAlign":"center","overflow":"visible"
-                        },
-                        style_header={
-                            "fontWeight":"700","backgroundColor":"#f5f5f5",
-                            "cursor":"pointer",
-                            "overflow":"visible",
-                            "textDecoration":"none"
-                        },
-                        tooltip_header=build_header_tooltips(adv_cols),
-                        tooltip_delay=0,
-                        tooltip_duration=None,
-                        fixed_rows={"headers": True},
-                        page_size=50,
-                        css=TOOLTIP_CSS_ABOVE,
-                    ),
-                ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px","background":"white"}),
-            ]),
-        ]),
-
-        # ---- state stores (used by callbacks in Sections 6–8)
-        dcc.Store(id="sel_pos", data=[]),
-        dcc.Store(id="filters_shoot_state"),
-        dcc.Store(id="filters_stats_state"),
-        dcc.Store(id="options_cache", data={}),
-    ]
-)
+# In Dash 3, layout can be a callable
+app.layout = safe_layout
 
 
 
