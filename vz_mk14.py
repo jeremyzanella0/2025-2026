@@ -73,13 +73,17 @@ app.layout = _safe_serve_layout
 # =========================
 # Config
 # =========================
-DATA_PATH = os.environ.get("BBALL_DATA", "data/possessions.json")
+# Hard-set the data folder so both apps use the same files
+DATA_PATH = r"C:\Users\jerem\OneDrive\Documents\Basketball\2025-2026\data\possessions.json"
 
-# NEW: match the entry app’s roster location scheme
-BASE_DIR    = os.path.dirname(DATA_PATH) or "."
+# Match the entry app’s roster + practices location scheme
+BASE_DIR    = os.path.dirname(DATA_PATH)
 ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
-# --- NEW: practices metadata (written by sc_mark_6 when starting a practice)
 PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
+
+print("[vz_mk14] Using data folder:", BASE_DIR)
+print("[vz_mk14] Possessions file:", DATA_PATH)
+
 
 
 # Court geometry (must match entry app exactly)
