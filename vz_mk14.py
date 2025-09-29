@@ -37,11 +37,38 @@ import logging
 log = logging.getLogger(__name__)
 
 
-# --- guaranteed bootstrap so the page never blanks on import ---
-app.layout = lambda: html.Div([
-    html.H1("CWB Practice Stats"),
-    html.P("Booting… baseline layout assigned at import time.")
-])
+# --- Render-safe layout wrapper placed EARLY so it always runs ---
+import sys, traceback
+from dash import html, dcc  # (dash_table can be imported inside serve_layout if needed)
+
+def _fallback_layout(msg=""):
+    return html.Div(
+        [
+            dcc.Location(id="url"),
+            html.H3("CWB Practice Stats"),
+            html.P("Fallback layout (serve_layout failed or not ready)."),
+            html.Pre(msg, style={"whiteSpace": "pre-wrap", "opacity": 0.7}),
+        ],
+        style={"padding": "16px"},
+    )
+
+def _safe_serve_layout():
+    """
+    Dash calls this to get the layout.
+    We call serve_layout(); if that errors, we return a small fallback instead of a blank page.
+    """
+    try:
+        if 'serve_layout' in globals() and callable(serve_layout):
+            return serve_layout()
+        return _fallback_layout("serve_layout not defined/callable at import time.")
+    except Exception:
+        print("[serve_layout] exception:", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
+        return _fallback_layout("Exception raised while building layout.")
+
+# IMPORTANT: assign NOW so later import-time errors don't leave us blank
+app.layout = _safe_serve_layout
+
 
 # =========================
 # Config
