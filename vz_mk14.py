@@ -37,6 +37,11 @@ import logging
 log = logging.getLogger(__name__)
 
 
+# --- guaranteed bootstrap so the page never blanks on import ---
+app.layout = lambda: html.Div([
+    html.H1("CWB Practice Stats"),
+    html.P("Booting… baseline layout assigned at import time.")
+])
 
 # =========================
 # Config
