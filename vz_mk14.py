@@ -20,6 +20,8 @@ app = Dash(
     suppress_callback_exceptions=True
 )
 server = app.server
+# Safety placeholder so Render never sees a blank layout at startup
+app.layout = html.Div([html.H1("CWB Practice Stats")])
 
 # =========================
 # Config
@@ -5679,20 +5681,18 @@ def show_shot_details(clickData, close_clicks):
 
 
 if __name__ == "__main__":
-    # Pick up the port from the environment if available (for deployment),
-    # otherwise default to 8051 with a fallback to 8052 for local testing.
+    import os
     port = int(os.environ.get("PORT", "8051"))
     print(f"Starting visualization server on http://localhost:{port}")
-
     try:
-        app.run_server(debug=False, host="0.0.0.0", port=port)
+        app.run(debug=False, host="0.0.0.0", port=port)
     except Exception as e:
         print(f"Failed to start server on port {port}: {e}")
-        if port == 8051:  # only try a local fallback if no env PORT is set
+        if port == 8051:
             fallback_port = 8052
             print(f"Trying fallback port {fallback_port}...")
             try:
-                app.run_server(debug=False, host="0.0.0.0", port=fallback_port)
+                app.run(debug=False, host="0.0.0.0", port=fallback_port)
             except Exception as e2:
                 print(f"Also failed on port {fallback_port}: {e2}")
                 print("Try running: python vz_mk14.py")
