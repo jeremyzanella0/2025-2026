@@ -36,25 +36,6 @@ from dash import html, dcc
 import logging
 log = logging.getLogger(__name__)
 
-def build_layout():
-    """Return the full app layout. Keep it safe if data is missing."""
-    try:
-        rows = safe_load_data()   # this already tolerates missing/corrupt data
-        return html.Div([
-            dcc.Location(id="url"),
-            html.H1("CWB Practice Stats"),
-            html.Div(id="app-status", children=f"Loaded {len(rows)} rows from DATA_PATH"),
-            # TODO: replace/extend with your real layout contents
-        ])
-    except Exception as e:
-        log.exception("Layout build failed")
-        return html.Div([
-            html.H1("CWB Practice Stats"),
-            html.Pre(f"Layout error: {e}")
-        ])
-
-# IMPORTANT: make layout a callable so Dash builds it at import time
-app.layout = build_layout
 
 
 # =========================
