@@ -3459,6 +3459,33 @@ def zone_legend_component():
 
 
 #-----------------------------------------Section 5--------------------------------------------------------------
+#
+# Robust, lazy layout builder that never returns None (prevents blank screen on Render)
+#
+
+# Small helpers so missing globals never crash the layout at import time
+def _g(name, default=None):
+    try:
+        return globals().get(name, default)
+    except Exception:
+        return default
+
+def _safe_fig(default_title=""):
+    try:
+        import plotly.graph_objects as go
+        fig = go.Figure()
+        if default_title:
+            fig.update_layout(title=default_title, margin=dict(l=10, r=10, t=30, b=10))
+        return fig
+    except Exception:
+        # Absolute fallback (shouldn't happen on Render)
+        return None
+
+def _safe_component(component, fallback):
+    try:
+        return component if component is not None else fallback
+    except Exception:
+        return fallback
 
 # ---------------- roster harvesting & normalization ----------------
 def _harvest_fullnames_from_any(value):
@@ -3853,6 +3880,7 @@ def _strip_trailing_modifiers(nm: str) -> str:
     return s
 
 # ====================== mk5 UI (tabs, filters, tables) ======================
+
 def _mk_multi(label, cid, placeholder="", options=None):
     return dcc.Dropdown(
         id=cid, options=(options or []), multi=True, placeholder=placeholder,
@@ -3900,13 +3928,7 @@ DEFENSE_OPTIONS = [
     {"label":"Zone","value":"Zone"},
 ]
 
-# ---------- Column ordering helpers (force your desired order even if builder returns extras)
 def _order_columns_with_alias_groups(cols, desired_id_groups):
-    """
-    desired_id_groups: list of either strings (single id) or list of ids (aliases).
-    Returns cols ordered by desired_id_groups; appends any extras afterward.
-    If a group lists aliases, the first found alias is used and others are skipped.
-    """
     cols_by_id = {c["id"]: c for c in cols}
     used = set()
     ordered = []
@@ -3920,15 +3942,12 @@ def _order_columns_with_alias_groups(cols, desired_id_groups):
         if chosen:
             ordered.append(chosen)
             used.add(chosen["id"])
-    # append any remaining cols in original appearance
     for c in cols:
         if c["id"] not in used:
             ordered.append(c); used.add(c["id"])
     return ordered
 
 # ---------- Build column configs (DO THIS ABOVE app.layout)
-
-# BASIC: ensure PRAC sits between Player and PTS
 _BS_DESIRED = [
     "Player","PRAC","PTS","FGM","FGA","FG%","2PM","2PA","2P%","3PM","3PA","3P%",
     "AST","SA","DRB","ORB","TRB","LBTO","DBTO","TO","STL","DEF","BLK"
@@ -3939,8 +3958,6 @@ _raw_basic_cols = (
 )
 basic_cols = _order_columns_with_alias_groups(_raw_basic_cols, _BS_DESIRED)
 
-# ADVANCED: enforce order; accept +/- id aliases if needed
-# Aliases for plus/minus handled: "+/-", "+/_", "plus_minus"
 _AS_DESIRED = [
     "Player","OP","DP","ORtg","DRtg","NET","eFG%","PPS","AST%","TOV%","AST/TO", ["+/-", "+/_", "plus_minus"]
 ]
@@ -3950,82 +3967,30 @@ _raw_adv_cols = (
 )
 adv_cols = _order_columns_with_alias_groups(_raw_adv_cols, _AS_DESIRED)
 
-# --- Tooltip CSS (global to both tables): force tooltips ABOVE header text ---
-TOOLTIP_CSS_ABOVE = [
-    {
-        "selector": ".dash-table-tooltip",
-        "rule": """
-            top: auto !important;
-            bottom: calc(100% + 6px) !important;
-            left: 50% !important;
-            transform: translateX(-50%) !important;
-            white-space: normal;
-            padding: 4px 6px;
-            background: #f8f9fa;
-            color: #111;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-            z-index: 1000;
-        """
-    },
-    {
-        "selector": ".dash-table-tooltip:before",
-        "rule": """
-            content: "";
-            position: absolute;
-            bottom: -6px;
-            left: 50%;
-            transform: translateX(-50%);
-            border-width: 6px 6px 0 6px;
-            border-style: solid;
-            border-color: #ccc transparent transparent transparent;
-        """
-    },
-    {
-        "selector": ".dash-table-tooltip:after",
-        "rule": """
-            content: "";
-            position: absolute;
-            bottom: -5px;
-            left: 50%;
-            transform: translateX(-50%);
-            border-width: 5px 5px 0 5px;
-            border-style: solid;
-            border-color: #f8f9fa transparent transparent transparent;
-        """
-    },
-    {"selector": ".dash-spreadsheet-container .dash-header", "rule": "overflow: visible;"},
-    {"selector": ".dash-spreadsheet .cell", "rule": "overflow: visible; position: relative;"}
-]
+# ---- LAZY LAYOUT: Dash will call this on each page load; must never raise or return None
+def serve_layout():
+    # Pull (or default) figures/components so missing globals do not break layout
+    shot_fig = _g("_initial_shot_fig", _safe_fig("Shot Chart"))
+    zone_fig = _g("_initial_zone_fig", _safe_fig("Hot/Cold Zones"))
+    zone_legend = _safe_component(_g("zone_legend_component"), lambda: html.Div())()
+    bs_table_id = (BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table")
 
-# ---- mk5 ADD: layout wrapped safely so cloud never renders blank
-import traceback
-
-def build_full_layout():
     return html.Div(
         style={"maxWidth":"1600px","margin":"0 auto","padding":"10px"},
         children=[
-            # --- Title added ---
             html.H1(
                 "CWB Practice Stats",
-                style={
-                    "textAlign": "center",
-                    "margin": "6px 0 12px 0",
-                    "fontFamily": "system-ui",
-                    "fontWeight": 800,
-                    "letterSpacing": "0.3px"
-                }
+                style={"textAlign":"center","margin":"6px 0 12px 0","fontFamily":"system-ui","fontWeight":800,"letterSpacing":"0.3px"}
             ),
 
             html.Div([
-                html.Div(f"Data source: {DATA_PATH}", style={"color":"#666","fontSize":"12px","marginBottom":"2px"}),
+                html.Div(f"Data source: {_g('DATA_PATH','(not set)')}", style={"color":"#666","fontSize":"12px","marginBottom":"2px"}),
                 html.Div("Charts update when data or filters change", style={"color":"#888","fontSize":"10px"}),
                 html.Div(id="status", style={"color":"#888","fontSize":"10px"}),
             ], style={"textAlign":"center","marginBottom":"8px"}),
 
             dcc.Tabs(id="tabs", value="tab_shooting", children=[
                 dcc.Tab(label="Shooting", value="tab_shooting", children=[
-                    # ---------- Shooting filters
                     html.Div([
                         _pill("Practice Date(s)", dcc.DatePickerRange(
                             id="flt_date_range_shoot",
@@ -4061,9 +4026,7 @@ def build_full_layout():
                         "borderRadius":"8px","padding":"10px","marginBottom":"10px"
                     }),
 
-                    # Single row: Stats | Shot Chart | Hot/Cold
                     html.Div([
-                        # --- 1) Shooting Stats (left) ---
                         html.Div([
                             html.Div("Shooting Stats", style={
                                 "textAlign": "center", "fontSize": "20px", "fontWeight": 700, "marginBottom": "6px"
@@ -4074,7 +4037,6 @@ def build_full_layout():
                         ], style={"width": "300px", "padding": "8px", "border": "1px solid #eee",
                                   "borderRadius": "8px", "background": "white"}),
 
-                        # --- 2) Shot Chart (middle) ---
                         html.Div([
                             html.Div("Shot Chart", style={
                                 "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
@@ -4082,17 +4044,16 @@ def build_full_layout():
                             dcc.Graph(
                                 id="shot_chart",
                                 config={"displayModeBar": False},
-                                figure=_initial_shot_fig,
+                                figure=shot_fig,
                                 animate=False,
                                 clear_on_unhover=False,
                             ),
                             html.Div([
-                                html.Span("● Make", style={"fontWeight": 600, "marginRight": "20px", "color": "green"}),
-                                html.Span("✖ Miss", style={"fontWeight": 600, "color": "red"}),
+                                html.Span("● Make", style={"color": "green", "marginRight": "20px", "fontWeight": 600}),
+                                html.Span("✖ Miss", style={"color": "red", "fontWeight": 600}),
                             ], style={"textAlign": "center", "marginTop": "-4px"}),
                         ], style={"width": "600px"}),
 
-                        # --- 3) Hot/Cold Zones (right) ---
                         html.Div([
                             html.Div("Hot/Cold Zones", style={
                                 "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
@@ -4100,11 +4061,11 @@ def build_full_layout():
                             dcc.Graph(
                                 id="zone_chart",
                                 config={"displayModeBar": False},
-                                figure=_initial_zone_fig,
+                                figure=zone_fig,
                                 animate=False,
                                 clear_on_unhover=False,
                             ),
-                            zone_legend_component(),
+                            zone_legend,
                         ], style={"width": "600px"}),
                     ], id="shooting-row", style={
                         "display": "grid",
@@ -4121,7 +4082,6 @@ def build_full_layout():
                 ]),
 
                 dcc.Tab(label="Stats", value="tab_stats", children=[
-                    # ---------- Stats tab filters (subset)
                     html.Div([
                         _pill("Practice Date(s)", dcc.DatePickerRange(
                             id="flt_date_range_stats",
@@ -4145,13 +4105,12 @@ def build_full_layout():
                         "borderRadius":"8px","padding":"10px","marginBottom":"10px"
                     }),
 
-                    # ---------- Stats table (BASIC)
                     html.Div([
                         html.Div("Basic Stats (click headers to sort)", style={
                             "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
                         }),
                         dash_table.DataTable(
-                            id=(BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table"),
+                            id=bs_table_id,
                             columns=basic_cols,
                             data=[],
                             sort_action="native",
@@ -4166,17 +4125,16 @@ def build_full_layout():
                                 "overflow":"visible",
                                 "textDecoration":"none"
                             },
-                            tooltip_header=build_header_tooltips(basic_cols),
+                            tooltip_header=build_header_tooltips(basic_cols) if 'build_header_tooltips' in globals() else {},
                             tooltip_delay=0,
                             tooltip_duration=None,
                             fixed_rows={"headers": True},
                             page_size=50,
-                            css=TOOLTIP_CSS_ABOVE,
+                            css=_g("TOOLTIP_CSS_ABOVE", []),
                         ),
                     ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px",
                               "background":"white","marginBottom":"10px"}),
 
-                    # ---------- Advanced Stats table (OP/DP + derived metrics)
                     html.Div([
                         html.Div("Advanced Stats (click headers to sort)", style={
                             "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
@@ -4197,12 +4155,12 @@ def build_full_layout():
                                 "overflow":"visible",
                                 "textDecoration":"none"
                             },
-                            tooltip_header=build_header_tooltips(adv_cols),
+                            tooltip_header=build_header_tooltips(adv_cols) if 'build_header_tooltips' in globals() else {},
                             tooltip_delay=0,
                             tooltip_duration=None,
                             fixed_rows={"headers": True},
                             page_size=50,
-                            css=TOOLTIP_CSS_ABOVE,
+                            css=_g("TOOLTIP_CSS_ABOVE", []),
                         ),
                     ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px","background":"white"}),
                 ]),
@@ -4216,21 +4174,8 @@ def build_full_layout():
         ]
     )
 
-def safe_layout():
-    try:
-        return build_full_layout()
-    except Exception:
-        tb = traceback.format_exc()
-        print("LAYOUT ERROR:\n", tb)
-        return html.Div([
-            html.H1("CWB Practice Stats"),
-            html.Hr(),
-            html.P("There was an error building the layout. See details below."),
-            html.Pre(tb, style={"whiteSpace":"pre-wrap","fontSize":"12px"})
-        ], style={"padding":"16px"})
-
-# In Dash 3, layout can be a callable
-app.layout = safe_layout
+# IMPORTANT: assign a callable, not a static tree. Prevents None layout on first hit.
+app.layout = serve_layout
 
 
 
