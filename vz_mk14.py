@@ -4174,22 +4174,53 @@ def serve_layout():
         ]
     )
 
-# IMPORTANT: assign a callable, not a static tree. Prevents None layout on first hit.
-app.layout = serve_layout
+# ============================== END OF SECTION 5 ==============================
+# Crash-proof layout assignment (prevents _dash-layout = null on first hit)
 
+import sys, traceback
+from dash import html, dcc
 
+def _fallback_layout(message: str = ""):
+    """Minimal layout so Dash never returns null; message shows in Render logs."""
+    return html.Div(
+        [
+            dcc.Location(id="url"),
+            html.H3("CWB Practice Stats"),
+            html.P("Layout failed to build; check logs."),
+            html.Pre(message, style={"whiteSpace": "pre-wrap", "opacity": 0.6}),
+        ],
+        id="fallback-root",
+        style={"padding": "16px"},
+    )
 
+def _safe_serve_layout():
+    """
+    Wrap the real serve_layout() so any exception still yields a minimal layout.
+    This prevents a blank page when files/paths/env aren't available at startup.
+    """
+    try:
+        if callable(serve_layout):
+            return serve_layout()
+        # If for some reason serve_layout isn't callable, don't crash.
+        return _fallback_layout("serve_layout is not callable at import time.")
+    except Exception:
+        # Log full traceback to stderr so it appears in Render logs.
+        print("[serve_layout] exception:", file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
+        return _fallback_layout("Exception raised while building layout.")
 
+# IMPORTANT: assign a callable (the safe wrapper), not a static tree.
+app.layout = _safe_serve_layout
 
 
 #-------------------------------------Section 6---------------------------------------
-
 # ---------------- callbacks ----------------
 from datetime import datetime, date
 from collections import defaultdict
 from dash import callback, Output, Input, State, no_update
 from uuid import uuid4
 import re, os, json, math, copy
+
 
 def _parse_date_any(s):
     if not s: return None
