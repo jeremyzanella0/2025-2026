@@ -1,5 +1,4 @@
 # ------------------SECTION 1--------------------------------------------------
-
 # vz_mk5 — adds shooting stats and stats table, adds filters
 
 import os
@@ -14,8 +13,9 @@ import plotly.graph_objects as go
 # =========================
 # App (title + expose Flask server)
 # =========================
-# App (title + expose Flask server)
 from flask import Response
+import logging
+log = logging.getLogger(__name__)
 
 app = Dash(
     __name__,
@@ -23,7 +23,7 @@ app = Dash(
     suppress_callback_exceptions=True,
     # These two lines make sure Dash’s JS/CSS routes line up on Render
     requests_pathname_prefix="/",
-    serve_locally=True,   # serve component bundles from this app (not CDN)
+    serve_locally=True,  # serve component bundles from this app (not CDN)
 )
 server = app.server
 
@@ -32,30 +32,27 @@ server = app.server
 def _healthz():
     return Response("ok", mimetype="text/plain")
 
-from dash import html, dcc
-import logging
-log = logging.getLogger(__name__)
-
-def build_layout():
-    """Return the full app layout. Keep it safe if data is missing."""
+def _safe_serve_layout():
+    """
+    Use the full UI builder (serve_layout) but never let an import-time error
+    blank the page in production. If something fails, show a readable fallback.
+    """
     try:
-        rows = safe_load_data()   # this already tolerates missing/corrupt data
-        return html.Div([
-            dcc.Location(id="url"),
-            html.H1("CWB Practice Stats"),
-            html.Div(id="app-status", children=f"Loaded {len(rows)} rows from DATA_PATH"),
-            # TODO: replace/extend with your real layout contents
-        ])
+        return serve_layout()  # <-- your real layout function defined later
     except Exception as e:
-        log.exception("Layout build failed")
-        return html.Div([
-            html.H1("CWB Practice Stats"),
-            html.Pre(f"Layout error: {e}")
-        ])
+        import traceback
+        log.exception("serve_layout failed during app start")
+        return html.Div(
+            [
+                html.H1("CWB Practice Stats"),
+                html.Div("The main layout failed to load. Check server logs for details."),
+                html.Pre(traceback.format_exc()),
+            ],
+            style={"padding": "2rem", "fontFamily": "system-ui, Arial, sans-serif"},
+        )
 
-# IMPORTANT: make layout a callable so Dash builds it at import time
-app.layout = build_layout
-
+# IMPORTANT: point Dash at the safe, real layout (no build_layout)
+app.layout = _safe_serve_layout
 
 # =========================
 # Config
@@ -4198,7 +4195,16 @@ def serve_layout():
         ]
     )
 
-# ============================== END OF SECTION 5 ==============================
+
+
+
+#-------------------------------------Section 6---------------------------------------
+
+
+
+
+
+
 # Crash-proof layout assignment (prevents _dash-layout = null on first hit)
 
 import sys, traceback
@@ -4237,7 +4243,7 @@ def _safe_serve_layout():
 app.layout = _safe_serve_layout
 
 
-#-------------------------------------Section 6---------------------------------------
+
 # ---------------- callbacks ----------------
 from datetime import datetime, date
 from collections import defaultdict
