@@ -36,54 +36,37 @@ from dash import html, dcc
 import logging
 log = logging.getLogger(__name__)
 
-
-# --- Render-safe layout wrapper placed EARLY so it always runs ---
-import sys, traceback
-from dash import html, dcc  # (dash_table can be imported inside serve_layout if needed)
-
-def _fallback_layout(msg=""):
-    return html.Div(
-        [
-            dcc.Location(id="url"),
-            html.H3("CWB Practice Stats"),
-            html.P("Fallback layout (serve_layout failed or not ready)."),
-            html.Pre(msg, style={"whiteSpace": "pre-wrap", "opacity": 0.7}),
-        ],
-        style={"padding": "16px"},
-    )
-
-def _safe_serve_layout():
-    """
-    Dash calls this to get the layout.
-    We call serve_layout(); if that errors, we return a small fallback instead of a blank page.
-    """
+def build_layout():
+    """Return the full app layout. Keep it safe if data is missing."""
     try:
-        if 'serve_layout' in globals() and callable(serve_layout):
-            return serve_layout()
-        return _fallback_layout("serve_layout not defined/callable at import time.")
-    except Exception:
-        print("[serve_layout] exception:", file=sys.stderr)
-        print(traceback.format_exc(), file=sys.stderr)
-        return _fallback_layout("Exception raised while building layout.")
+        rows = safe_load_data()   # this already tolerates missing/corrupt data
+        return html.Div([
+            dcc.Location(id="url"),
+            html.H1("CWB Practice Stats"),
+            html.Div(id="app-status", children=f"Loaded {len(rows)} rows from DATA_PATH"),
+            # TODO: replace/extend with your real layout contents
+        ])
+    except Exception as e:
+        log.exception("Layout build failed")
+        return html.Div([
+            html.H1("CWB Practice Stats"),
+            html.Pre(f"Layout error: {e}")
+        ])
 
-# IMPORTANT: assign NOW so later import-time errors don't leave us blank
-app.layout = _safe_serve_layout
+# IMPORTANT: make layout a callable so Dash builds it at import time
+app.layout = build_layout
 
 
 # =========================
 # Config
 # =========================
-# Hard-set the data folder so both apps use the same files
-DATA_PATH = r"C:\Users\jerem\OneDrive\Documents\Basketball\2025-2026\data\possessions.json"
+DATA_PATH = os.environ.get("BBALL_DATA", "data/possessions.json")
 
-# Match the entry app’s roster + practices location scheme
-BASE_DIR    = os.path.dirname(DATA_PATH)
+# NEW: match the entry app’s roster location scheme
+BASE_DIR    = os.path.dirname(DATA_PATH) or "."
 ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
+# --- NEW: practices metadata (written by sc_mark_6 when starting a practice)
 PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
-
-print("[vz_mk14] Using data folder:", BASE_DIR)
-print("[vz_mk14] Possessions file:", DATA_PATH)
-
 
 
 # Court geometry (must match entry app exactly)
@@ -4010,123 +3993,61 @@ adv_cols = _order_columns_with_alias_groups(_raw_adv_cols, _AS_DESIRED)
 
 # ---- LAZY LAYOUT: Dash will call this on each page load; must never raise or return None
 def serve_layout():
-    from dash import dash_table  # needed for DataTable
-
-    # --- helper fallbacks so layout never raises if globals aren't ready ---
-    # get a global attr safely
-    def _gg(name, default=None):
-        return globals().get(name, default)
-
-    # use existing _g helper if present, else basic lookup
-    _G = _gg("_g", None)
-    def _get(name, default=None):
-        if callable(_G):
-            return _G(name, default)
-        return _gg(name, default)
-
-    # fallbacks for UI builders
-    def _pill_fallback(label, component):
-        return html.Div([
-            html.Div(str(label), style={"fontWeight": 600, "fontSize": "12px", "marginBottom": "4px"}),
-            component
-        ], style={"display": "flex", "flexDirection": "column", "minWidth": "180px"})
-    pill = _gg("_pill", _pill_fallback)
-
-    def _mk_multi_fallback(label, cid, placeholder="Select..."):
-        return dcc.Dropdown(id=cid, options=[], multi=True, placeholder=placeholder, style={"minWidth": "200px"})
-    mk_multi = _gg("_mk_multi", _mk_multi_fallback)
-
-    # safe component wrapper (zone legend, etc.)
-    _safe_component_fn = _gg("_safe_component", None)
-    def _safe_component_call(cmp_or_factory, fallback_factory=lambda: html.Div()):
-        try:
-            if callable(_safe_component_fn):
-                return _safe_component_fn(cmp_or_factory, fallback_factory)()
-            # if we weren't given the wrapper, try to use the thing directly
-            return (cmp_or_factory() if callable(cmp_or_factory) else cmp_or_factory) or fallback_factory()
-        except Exception:
-            return fallback_factory()
-
-    # figures (tolerate missing helpers)
-    _safe_fig_fn = _gg("_safe_fig", None)
-    def _safe_fig_local(title):
-        if callable(_safe_fig_fn):
-            return _safe_fig_fn(title)
-        # minimal blank fig fallback
-        import plotly.graph_objects as go
-        fig = go.Figure()
-        fig.update_layout(title=title, margin=dict(l=0, r=0, t=40, b=0))
-        return fig
-
-    shot_fig = _get("_initial_shot_fig", _safe_fig_local("Shot Chart"))
-    zone_fig = _get("_initial_zone_fig", _safe_fig_local("Hot/Cold Zones"))
-    zone_legend = _safe_component_call(_get("zone_legend_component"), lambda: html.Div())
-
-    # IDs / columns / tooltips
-    bs_table_id = _get("BASIC_STATS_TABLE_ID", "stats_table")
-    adv_table_id = _get("ADVANCED_STATS_TABLE_ID", "advanced_stats_table")
-    basic_cols   = _get("basic_cols", [])
-    adv_cols     = _get("adv_cols", [])
-    build_header_tooltips = _gg("build_header_tooltips", None)
-    TOOLTIP_CSS_ABOVE = _get("TOOLTIP_CSS_ABOVE", [])
-
-    # option lists
-    ONBALL_OPTIONS  = _get("ONBALL_OPTIONS", [])
-    OFFBALL_OPTIONS = _get("OFFBALL_OPTIONS", [])
-    DEFENSE_OPTIONS = _get("DEFENSE_OPTIONS", [])
+    # Pull (or default) figures/components so missing globals do not break layout
+    shot_fig = _g("_initial_shot_fig", _safe_fig("Shot Chart"))
+    zone_fig = _g("_initial_zone_fig", _safe_fig("Hot/Cold Zones"))
+    zone_legend = _safe_component(_g("zone_legend_component"), lambda: html.Div())()
+    bs_table_id = (BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table")
 
     return html.Div(
-        style={"maxWidth": "1600px", "margin": "0 auto", "padding": "10px"},
+        style={"maxWidth":"1600px","margin":"0 auto","padding":"10px"},
         children=[
             html.H1(
                 "CWB Practice Stats",
-                style={"textAlign": "center", "margin": "6px 0 12px 0",
-                       "fontFamily": "system-ui", "fontWeight": 800, "letterSpacing": "0.3px"}
+                style={"textAlign":"center","margin":"6px 0 12px 0","fontFamily":"system-ui","fontWeight":800,"letterSpacing":"0.3px"}
             ),
 
             html.Div([
-                html.Div(f"Data source: {_get('DATA_PATH', '(not set)')}",
-                         style={"color": "#666", "fontSize": "12px", "marginBottom": "2px"}),
-                html.Div("Charts update when data or filters change",
-                         style={"color": "#888", "fontSize": "10px"}),
-                html.Div(id="status", style={"color": "#888", "fontSize": "10px"}),
-            ], style={"textAlign": "center", "marginBottom": "8px"}),
+                html.Div(f"Data source: {_g('DATA_PATH','(not set)')}", style={"color":"#666","fontSize":"12px","marginBottom":"2px"}),
+                html.Div("Charts update when data or filters change", style={"color":"#888","fontSize":"10px"}),
+                html.Div(id="status", style={"color":"#888","fontSize":"10px"}),
+            ], style={"textAlign":"center","marginBottom":"8px"}),
 
             dcc.Tabs(id="tabs", value="tab_shooting", children=[
                 dcc.Tab(label="Shooting", value="tab_shooting", children=[
                     html.Div([
-                        pill("Practice Date(s)", dcc.DatePickerRange(
+                        _pill("Practice Date(s)", dcc.DatePickerRange(
                             id="flt_date_range_shoot",
                             min_date_allowed=None, max_date_allowed=None,
                             start_date=None, end_date=None,
                             minimum_nights=0,
                             display_format="YYYY-MM-DD",
-                            style={"background": "white"},
+                            style={"background":"white"}
                         )),
-                        pill("Drill Size", mk_multi("Drill Size", "flt_drill_size_shoot", "e.g. 3v3 / 5v5")),
-                        pill("Drill", mk_multi("Drill", "flt_drill_full_shoot", "e.g. 5v5 Stags")),
-                        pill("Shooter", mk_multi("Shooter", "flt_shooter", "Filter by shooter")),
-                        pill("Defender(s)", mk_multi("Defender(s)", "flt_defenders", "Who contested the shot")),
-                        pill("Assister", mk_multi("Assister", "flt_assister", "Passer on made FG")),
-                        pill("Screen Assister", mk_multi("Screen Assister", "flt_screen_assister", "Who set the screen")),
-                        pill("On-Ball Action", dcc.Dropdown(
-                            id="flt_onball", options=ONBALL_OPTIONS, multi=True,
-                            placeholder="Select on-ball actions", style={"minWidth": "200px"}
+                        _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_shoot","e.g. 3v3 / 5v5")),
+                        _pill("Drill", _mk_multi("Drill","flt_drill_full_shoot","e.g. 5v5 Stags")),
+                        _pill("Shooter", _mk_multi("Shooter","flt_shooter","Filter by shooter")),
+                        _pill("Defender(s)", _mk_multi("Defender(s)","flt_defenders","Who contested the shot")),
+                        _pill("Assister", _mk_multi("Assister","flt_assister","Passer on made FG")),
+                        _pill("Screen Assister", _mk_multi("Screen Assister","flt_screen_assister","Who set the screen")),
+                        _pill("On-Ball Action", dcc.Dropdown(
+                            id="flt_onball", options=ONBALL_OPTIONS, multi=True, placeholder="Select on-ball actions",
+                            style={"minWidth":"200px"}
                         )),
-                        pill("Off-Ball Action", dcc.Dropdown(
-                            id="flt_offball", options=OFFBALL_OPTIONS, multi=True,
-                            placeholder="Select off-ball actions", style={"minWidth": "200px"}
+                        _pill("Off-Ball Action", dcc.Dropdown(
+                            id="flt_offball", options=OFFBALL_OPTIONS, multi=True, placeholder="Select off-ball actions",
+                            style={"minWidth":"200px"}
                         )),
-                        pill("Defense", dcc.Dropdown(
-                            id="flt_defense_shoot", options=DEFENSE_OPTIONS, multi=True,
-                            placeholder="Man / Zone", style={"minWidth": "140px"}
+                        _pill("Defense", dcc.Dropdown(
+                            id="flt_defense_shoot", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
+                            style={"minWidth":"140px"}
                         )),
                         html.Button("Clear", id="btn_clear_shoot", n_clicks=0,
-                                    style={"height": "34px", "alignSelf": "flex-end", "marginLeft": "8px"}),
+                                    style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
                     ], style={
-                        "display": "flex", "flexWrap": "wrap", "gap": "12px",
-                        "alignItems": "end", "background": "#fafafa", "border": "1px solid #eee",
-                        "borderRadius": "8px", "padding": "10px", "marginBottom": "10px"
+                        "display":"flex","flexWrap":"wrap","gap":"12px",
+                        "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
+                        "borderRadius":"8px","padding":"10px","marginBottom":"10px"
                     }),
 
                     html.Div([
@@ -4181,87 +4102,91 @@ def serve_layout():
                         "overflowX": "visible",
                     }),
 
-                    html.Div(id="shot_details", style={"maxWidth": "920px", "margin": "14px auto 0 auto"}),
+                    html.Div(id="shot_details", style={"maxWidth":"920px","margin":"14px auto 0 auto"}),
                 ]),
 
                 dcc.Tab(label="Stats", value="tab_stats", children=[
                     html.Div([
-                        pill("Practice Date(s)", dcc.DatePickerRange(
+                        _pill("Practice Date(s)", dcc.DatePickerRange(
                             id="flt_date_range_stats",
                             min_date_allowed=None, max_date_allowed=None,
                             start_date=None, end_date=None,
                             minimum_nights=0,
                             display_format="YYYY-MM-DD",
-                            style={"background": "white"}
+                            style={"background":"white"}
                         )),
-                        pill("Drill Size", mk_multi("Drill Size", "flt_drill_size_stats", "e.g. 3v3 / 5v5")),
-                        pill("Drill", mk_multi("Drill", "flt_drill_full_stats", "e.g. 5v5 Stags")),
-                        pill("Defense", dcc.Dropdown(
-                            id="flt_defense_stats", options=DEFENSE_OPTIONS, multi=True,
-                            placeholder="Man / Zone", style={"minWidth": "140px"}
+                        _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_stats","e.g. 3v3 / 5v5")),
+                        _pill("Drill", _mk_multi("Drill","flt_drill_full_stats","e.g. 5v5 Stags")),
+                        _pill("Defense", dcc.Dropdown(
+                            id="flt_defense_stats", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
+                            style={"minWidth":"140px"}
                         )),
                         html.Button("Clear", id="btn_clear_stats", n_clicks=0,
-                                    style={"height": "34px", "alignSelf": "flex-end", "marginLeft": "8px"}),
+                                    style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
                     ], style={
-                        "display": "flex", "flexWrap": "wrap", "gap": "12px",
-                        "alignItems": "end", "background": "#fafafa", "border": "1px solid #eee",
-                        "borderRadius": "8px", "padding": "10px", "marginBottom": "10px"
+                        "display":"flex","flexWrap":"wrap","gap":"12px",
+                        "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
+                        "borderRadius":"8px","padding":"10px","marginBottom":"10px"
                     }),
 
                     html.Div([
                         html.Div("Basic Stats (click headers to sort)", style={
-                            "fontSize": "18px", "fontWeight": 700, "marginBottom": "6px"
+                            "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
                         }),
                         dash_table.DataTable(
                             id=bs_table_id,
                             columns=basic_cols,
                             data=[],
                             sort_action="native",
-                            style_table={"overflowX": "auto"},
+                            style_table={"overflowX":"auto"},
                             style_cell={
-                                "fontFamily": "Arial", "fontSize": "13px", "padding": "6px",
-                                "textAlign": "center", "overflow": "visible"
+                                "fontFamily":"Arial","fontSize":"13px","padding":"6px",
+                                "textAlign":"center","overflow":"visible"
                             },
                             style_header={
-                                "fontWeight": "700", "backgroundColor": "#f5f5f5",
-                                "cursor": "pointer", "overflow": "visible", "textDecoration": "none"
+                                "fontWeight":"700","backgroundColor":"#f5f5f5",
+                                "cursor":"pointer",
+                                "overflow":"visible",
+                                "textDecoration":"none"
                             },
-                            tooltip_header=(build_header_tooltips(basic_cols) if callable(build_header_tooltips) else {}),
+                            tooltip_header=build_header_tooltips(basic_cols) if 'build_header_tooltips' in globals() else {},
                             tooltip_delay=0,
                             tooltip_duration=None,
                             fixed_rows={"headers": True},
                             page_size=50,
-                            css=TOOLTIP_CSS_ABOVE,
+                            css=_g("TOOLTIP_CSS_ABOVE", []),
                         ),
-                    ], style={"border": "1px solid #eee", "borderRadius": "8px", "padding": "8px",
-                              "background": "white", "marginBottom": "10px"}),
+                    ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px",
+                              "background":"white","marginBottom":"10px"}),
 
                     html.Div([
                         html.Div("Advanced Stats (click headers to sort)", style={
-                            "fontSize": "18px", "fontWeight": 700, "marginBottom": "6px"
+                            "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
                         }),
                         dash_table.DataTable(
-                            id=adv_table_id,
+                            id="advanced_stats_table",
                             columns=adv_cols,
                             data=[],
                             sort_action="native",
-                            style_table={"overflowX": "auto"},
+                            style_table={"overflowX":"auto"},
                             style_cell={
-                                "fontFamily": "Arial", "fontSize": "13px", "padding": "6px",
-                                "textAlign": "center", "overflow": "visible"
+                                "fontFamily":"Arial","fontSize":"13px","padding":"6px",
+                                "textAlign":"center","overflow":"visible"
                             },
                             style_header={
-                                "fontWeight": "700", "backgroundColor": "#f5f5f5",
-                                "cursor": "pointer", "overflow": "visible", "textDecoration": "none"
+                                "fontWeight":"700","backgroundColor":"#f5f5f5",
+                                "cursor":"pointer",
+                                "overflow":"visible",
+                                "textDecoration":"none"
                             },
-                            tooltip_header=(build_header_tooltips(adv_cols) if callable(build_header_tooltips) else {}),
+                            tooltip_header=build_header_tooltips(adv_cols) if 'build_header_tooltips' in globals() else {},
                             tooltip_delay=0,
                             tooltip_duration=None,
                             fixed_rows={"headers": True},
                             page_size=50,
-                            css=TOOLTIP_CSS_ABOVE,
+                            css=_g("TOOLTIP_CSS_ABOVE", []),
                         ),
-                    ], style={"border": "1px solid #eee", "borderRadius": "8px", "padding": "8px", "background": "white"}),
+                    ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px","background":"white"}),
                 ]),
             ]),
 
@@ -4273,8 +4198,8 @@ def serve_layout():
         ]
     )
 
-
-#-------------------------------------Section 6---------------------------------------
+# ============================== END OF SECTION 5 ==============================
+# Crash-proof layout assignment (prevents _dash-layout = null on first hit)
 
 import sys, traceback
 from dash import html, dcc
@@ -4312,7 +4237,7 @@ def _safe_serve_layout():
 app.layout = _safe_serve_layout
 
 
-
+#-------------------------------------Section 6---------------------------------------
 # ---------------- callbacks ----------------
 from datetime import datetime, date
 from collections import defaultdict
