@@ -58,12 +58,26 @@ app.layout = _safe_serve_layout
 # Config
 # =========================
 DATA_PATH = os.environ.get("BBALL_DATA", "data/possessions.json")
-
-# NEW: match the entry app’s roster location scheme
 BASE_DIR    = os.path.dirname(DATA_PATH) or "."
 ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
-# --- NEW: practices metadata (written by sc_mark_6 when starting a practice)
 PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
+
+# --- visibility in Render logs ---
+def _count_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, list):  return len(j)
+        if isinstance(j, dict):  return len(j)
+        return -1
+    except Exception as e:
+        print(f"[count_json] {path}: {e}")
+        return -1
+
+print(f"[PATHS] DATA_PATH={DATA_PATH} exists={os.path.exists(DATA_PATH)}")
+print(f"[PATHS] ROSTER_PATH={ROSTER_PATH} exists={os.path.exists(ROSTER_PATH)}")
+print(f"[PATHS] PRACTICES_PATH={PRACTICES_PATH} exists={os.path.exists(PRACTICES_PATH)}")
+print(f"[COUNTS] possessions={_count_json(DATA_PATH)}, roster={_count_json(ROSTER_PATH)}, practices={_count_json(PRACTICES_PATH)}")
 
 
 # Court geometry (must match entry app exactly)
@@ -4282,23 +4296,33 @@ def _is_three(x,y):
 # ===== Strict roster name cleaning (uses Section 2 canonicalizer) =====
 _name_token_re = re.compile(r"[A-Za-z']+")
 
+# Never let a name collapse to "" — fall back to the raw string so stats aggregate.
 def _force_to_roster_name(piece: str) -> str:
     s = (piece or "").strip()
     if not s:
         return ""
+    # strict match (e.g., full name already in roster map)
     nm = _strict_canon_name(s)
-    if nm: return nm
+    if nm:
+        return nm
+    # loose match on full string
     nm = _normalize_to_roster(s)
-    if nm and " " in nm: return nm
+    if nm and " " in nm:
+        return nm
+    # try adjacent tokens as "First Last"
     toks = _name_token_re.findall(s)
-    for i in range(len(toks)-1):
+    for i in range(len(toks) - 1):
         cand = f"{toks[i]} {toks[i+1]}"
         nm = _normalize_to_roster(cand)
-        if nm and " " in nm: return nm
+        if nm and " " in nm:
+            return nm
+    # last-ditch: single tokens reversed (last name first)
     for t in reversed(toks):
         nm = _normalize_to_roster(t)
-        if nm and " " in nm: return nm
-    return ""
+        if nm and " " in nm:
+            return nm
+    # ▼ critical change: use the raw string instead of "" so stats don’t vanish
+    return s
 
 def _clean_name_list_to_roster(lst) -> list[str]:
     out, seen = [], set()
