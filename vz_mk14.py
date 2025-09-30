@@ -4273,15 +4273,13 @@ def serve_layout():
 
 #-------------------------------------Section 6---------------------------------------
 
-
-
-
-
-
 # Crash-proof layout assignment (prevents _dash-layout = null on first hit)
-
 import sys, traceback
-from dash import html, dcc
+from dash import html, dcc, callback, Output, Input, State, no_update
+from datetime import datetime, date
+from collections import defaultdict
+from uuid import uuid4
+import re, os, json, math, copy
 
 def _fallback_layout(message: str = ""):
     """Minimal layout so Dash never returns null; message shows in Render logs."""
@@ -4291,19 +4289,61 @@ def _fallback_layout(message: str = ""):
             html.H3("CWB Practice Stats"),
             html.P("Layout failed to build; check logs."),
             html.Pre(message, style={"whiteSpace": "pre-wrap", "opacity": 0.6}),
+            # ensure we still inject init_pulse so callbacks can fire even on fallback
+            dcc.Interval(id="init_pulse", interval=1, n_intervals=0, max_intervals=1),
+            html.Div(id="status", style={"color": "#888", "fontSize": "10px"}),
         ],
         id="fallback-root",
         style={"padding": "16px"},
     )
 
+def _has_component_with_id(node, target_id: str) -> bool:
+    """Recursively check if a component with id=target_id exists somewhere in the layout tree."""
+    try:
+        if getattr(node, "id", None) == target_id:
+            return True
+        kids = getattr(node, "children", None)
+        if kids is None:
+            return False
+        if isinstance(kids, (list, tuple)):
+            return any(_has_component_with_id(k, target_id) for k in kids)
+        return _has_component_with_id(kids, target_id)
+    except Exception:
+        return False
+
+def _append_child(root, child):
+    """If root has a list-like children, append child; if single child, make it a list."""
+    try:
+        if hasattr(root, "children"):
+            kids = root.children
+            if kids is None:
+                root.children = [child]
+            elif isinstance(kids, (list, tuple)):
+                if isinstance(kids, tuple):
+                    kids = list(kids)
+                kids.append(child)
+                root.children = kids
+            else:
+                root.children = [kids, child]
+    except Exception:
+        pass
+    return root
+
+def _ensure_init_pulse(root):
+    """Guarantee there is exactly one dcc.Interval(id='init_pulse') in the tree."""
+    if not _has_component_with_id(root, "init_pulse"):
+        _append_child(root, dcc.Interval(id="init_pulse", interval=1, n_intervals=0, max_intervals=1))
+    return root
+
 def _safe_serve_layout():
     """
     Wrap the real serve_layout() so any exception still yields a minimal layout.
-    This prevents a blank page when files/paths/env aren't available at startup.
+    Also ensure an 'init_pulse' Interval exists so first-load callbacks can run.
     """
     try:
         if callable(serve_layout):
-            return serve_layout()
+            layout = serve_layout()
+            return _ensure_init_pulse(layout)
         # If for some reason serve_layout isn't callable, don't crash.
         return _fallback_layout("serve_layout is not callable at import time.")
     except Exception:
@@ -4316,25 +4356,25 @@ def _safe_serve_layout():
 app.layout = _safe_serve_layout
 
 
+# ---------------- one-time status init (proves callbacks + gives a count) ----------------
+def _count_rows_fast(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, dict) and "rows" in j:
+            j = j.get("rows") or []
+        return len(j) if isinstance(j, list) else 0
+    except Exception:
+        return 0
 
-# ---------------- callbacks ----------------
-from datetime import datetime, date
-from collections import defaultdict
-from dash import callback, Output, Input, State, no_update
-from uuid import uuid4
-import re, os, json, math, copy
+@callback(Output("status", "children"), Input("init_pulse", "n_intervals"), prevent_initial_call=False)
+def _init_status(_n):
+    # Keep it simple; real “filtered” counts will update from your main callbacks.
+    n = _count_rows_fast(DATA_PATH)
+    return f"Loaded {n} shots • callbacks are alive"
 
 
-
-# --- sanity ping: proves callbacks are wired in prod ---
-from dash import callback, Output, Input
-
-@callback(Output("status", "children"), Input("tabs", "value"), prevent_initial_call=False)
-def _ping_callbacks(tab):
-    return "callbacks are alive"
-
-
-
+# ---------------- helpers used by downstream callbacks ----------------
 
 def _parse_date_any(s):
     if not s: return None
@@ -4353,45 +4393,40 @@ def _get_drill_size(drill: str) -> str:
     m = _DRILL_SIZE_RE.search(drill)
     return (m.group(1) if m else "").lower()
 
-def _distance_from_rim(x,y):
+def _distance_from_rim(x, y):
     try:
         return math.hypot(float(x) - RIM_X, float(y) - RIM_Y)
     except:
         return 0.0
 
-def _is_three(x,y):
-    return _distance_from_rim(x,y) >= THREE_R - 1e-9
+def _is_three(x, y):
+    return _distance_from_rim(x, y) >= THREE_R - 1e-9
 
 
 # ===== Strict roster name cleaning (uses Section 2 canonicalizer) =====
 _name_token_re = re.compile(r"[A-Za-z']+")
 
-# Never let a name collapse to "" — fall back to the raw string so stats aggregate.
 def _force_to_roster_name(piece: str) -> str:
+    """Never let a name collapse to ''. Fall back to the raw token so stats still aggregate."""
     s = (piece or "").strip()
     if not s:
         return ""
-    # strict match (e.g., full name already in roster map)
     nm = _strict_canon_name(s)
     if nm:
         return nm
-    # loose match on full string
     nm = _normalize_to_roster(s)
     if nm and " " in nm:
         return nm
-    # try adjacent tokens as "First Last"
     toks = _name_token_re.findall(s)
     for i in range(len(toks) - 1):
         cand = f"{toks[i]} {toks[i+1]}"
         nm = _normalize_to_roster(cand)
         if nm and " " in nm:
             return nm
-    # last-ditch: single tokens reversed (last name first)
     for t in reversed(toks):
         nm = _normalize_to_roster(t)
         if nm and " " in nm:
             return nm
-    # ▼ critical change: use the raw string instead of "" so stats don’t vanish
     return s
 
 def _clean_name_list_to_roster(lst) -> list[str]:
@@ -4709,7 +4744,6 @@ def _rows_stats_all():
     return rows_for_stats
 
 
-
 def _uniq_sorted(seq):
     seen = set(); out = []
     for s in (seq or []):
@@ -4796,7 +4830,7 @@ def _filter_rows(rows,
     return out
 
 
-# ===================== FIX: Clear fade on Close =====================
+# ===================== Clear highlight on Close (fixed IDs) =====================
 
 def _clear_selection_and_bump(fig: dict) -> dict:
     """Remove selection + highlight, and return a *new* fig object."""
@@ -4804,7 +4838,6 @@ def _clear_selection_and_bump(fig: dict) -> dict:
         return fig
     fig = copy.deepcopy(fig)
 
-    # remove any selectedpoints & give traces fresh uids
     new_data = []
     for tr in fig.get("data", []):
         d = dict(tr) if isinstance(tr, dict) else tr
@@ -4813,30 +4846,28 @@ def _clear_selection_and_bump(fig: dict) -> dict:
         new_data.append(d)
     fig["data"] = new_data
 
-    # remove highlight rectangle(s)
     layout = dict(fig.get("layout", {}) or {})
     shapes = list(layout.get("shapes", []))
     layout["shapes"] = [s for s in shapes if not (isinstance(s, dict) and s.get("name") == "shot-highlight")]
-    # do NOT set layout.uirevision here — we'll bump the Graph's uirevision prop instead
     fig["layout"] = layout
     return fig
 
 @callback(
-    Output("shot-chart", "figure"),
-    Output("shot-chart", "selectedData"),
-    Output("shot-chart", "clickData"),
-    Output("shot-chart", "uirevision"),   # 🔑 bump the Graph prop, not just layout
+    Output("shot_chart", "figure"),          # << fixed: underscore ID matches layout
+    Output("shot_chart", "selectedData"),
+    Output("shot_chart", "clickData"),
+    Output("shot_chart", "uirevision"),
     Input("btn-close-shot", "n_clicks"),
-    State("shot-chart", "figure"),
+    State("shot_chart", "figure"),
     prevent_initial_call=True,
 )
 def on_close_pbp(n, fig):
     if not n:
         return no_update, no_update, no_update, no_update
     new_fig = _clear_selection_and_bump(fig)
-    # bump the Graph component's uirevision so Plotly forgets the selection
     return new_fig, None, None, str(uuid4())
 # ================================================================================
+
 
 
 
@@ -4846,7 +4877,7 @@ from collections import defaultdict
 from datetime import date
 import math, copy
 from uuid import uuid4
-from dash import html, no_update, Output, Input, State
+from dash import html, no_update, Output, Input, State, callback
 
 def _rows_to_shots(rows):
     return [{"x": r["x"], "y": r["y"], "result": r["result"]} for r in rows]
@@ -5069,8 +5100,8 @@ def _advanced_from_stats_rows(stats_full):
     return out
 
 
-# ===== populate dynamic filter options =====
-@app.callback(
+# ===== populate dynamic filter options (fires on first load via init_pulse) =====
+@callback(
     Output("flt_drill_size_shoot", "options"),
     Output("flt_drill_full_shoot", "options"),
     Output("flt_shooter", "options"),
@@ -5083,10 +5114,11 @@ def _advanced_from_stats_rows(stats_full):
     Output("flt_date_range_shoot", "max_date_allowed"),
     Output("flt_date_range_stats", "min_date_allowed"),
     Output("flt_date_range_stats", "max_date_allowed"),
+    Input("init_pulse", "n_intervals"),     # 🔑 first-load trigger
     Input("tabs","value"),
     prevent_initial_call=False
 )
-def populate_filter_options(_tab_value):
+def populate_filter_options(_n_init, _tab_value):
     rows = _rows_full()
     drill_sizes = _uniq_sorted([r.get("drill_size") for r in rows])
     drills_full = _uniq_sorted([r.get("drill") for r in rows])
@@ -5104,7 +5136,7 @@ def populate_filter_options(_tab_value):
 
 
 # ===== clear filter buttons =====
-@app.callback(
+@callback(
     Output("flt_date_range_shoot", "start_date"),
     Output("flt_date_range_shoot", "end_date"),
     Output("flt_drill_size_shoot", "value"),
@@ -5122,7 +5154,7 @@ def populate_filter_options(_tab_value):
 def clear_shoot_filters(nc):
     return (None, None, [], [], [], [], [], [], [], [], [])
 
-@app.callback(
+@callback(
     Output("flt_date_range_stats", "start_date"),
     Output("flt_date_range_stats", "end_date"),
     Output("flt_drill_size_stats", "value"),
@@ -5135,14 +5167,17 @@ def clear_stats_filters(nc):
     return (None, None, [], [], [])
 
 
-# ===== core computation (fast; does NOT react to sel_pos) =====
-@app.callback(
+# ===== core computation (fires on first load via init_pulse) =====
+@callback(
     Output("shot_chart","figure"),
     Output("zone_chart","figure"),
     Output("shooting_stats_box","children"),
     Output("status","children"),
     Output(BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table","data"),
     Output("advanced_stats_table","data"),
+
+    # 🔑 first-load trigger
+    Input("init_pulse","n_intervals"),
 
     # SHOOTING filters
     Input("flt_date_range_shoot","start_date"),
@@ -5167,7 +5202,8 @@ def clear_stats_filters(nc):
     State("sel_pos","data"),   # only to keep highlight if a rebuild happens
     prevent_initial_call=False
 )
-def compute_all(sd_sh, ed_sh, sz_sh, dr_sh, shtr, defs, asts, scrs, onb, offb, def_sh,
+def compute_all(_n_init,
+                sd_sh, ed_sh, sz_sh, dr_sh, shtr, defs, asts, scrs, onb, offb, def_sh,
                 sd_st, ed_st, sz_st, dr_st, def_st,
                 sel_coords):
     try:
@@ -5223,25 +5259,8 @@ def compute_all(sd_sh, ed_sh, sz_sh, dr_sh, shtr, defs, asts, scrs, onb, offb, d
         return (fallback_shots, fallback_zone, html.Div(), f"Error computing view: {e}", [], [])
 
 
-# ---------------- Legend text population (unchanged) ----------------
-def _legend_bins_for_zone(zid: int):
-    last = None; cuts = []
-    for p in range(0, 101):
-        col = str(_rgba_for_zone(zid, attempts=1, pct=p))
-        if last is None: last = col
-        elif col != last: cuts.append(p); last = col
-    def fmt(a,b): 
-        if a<0: a=0
-        if b>100: b=100
-        return f"{a}–{b}%"
-    if len(cuts) >= 2:
-        t1, t2 = cuts[0], cuts[1]
-        return (fmt(0, max(t1-1,0)), fmt(t1, max(t2-1,t1)), f"{t2}%+")
-    if len(cuts) == 1:
-        t1 = cuts[0]; return (fmt(0, max(t1-1,0)), f"{t1}%+", "—")
-    return ("0–100%", "—", "—")
-
-@app.callback(
+# ---------------- Legend text population (unchanged, but runs immediately) ----------------
+@callback(
     Output("legend_close_low", "children"),
     Output("legend_close_mid", "children"),
     Output("legend_close_high", "children"),
@@ -5255,6 +5274,23 @@ def _legend_bins_for_zone(zid: int):
     prevent_initial_call=False
 )
 def update_zone_legend(_zone_fig):
+    def _legend_bins_for_zone(zid: int):
+        last = None; cuts = []
+        for p in range(0, 101):
+            col = str(_rgba_for_zone(zid, attempts=1, pct=p))
+            if last is None: last = col
+            elif col != last: cuts.append(p); last = col
+        def fmt(a,b):
+            if a<0: a=0
+            if b>100: b=100
+            return f"{a}–{b}%"
+        if len(cuts) >= 2:
+            t1, t2 = cuts[0], cuts[1]
+            return (fmt(0, max(t1-1,0)), fmt(t1, max(t2-1,t1)), f"{t2}%+")
+        if len(cuts) == 1:
+            t1 = cuts[0]; return (fmt(0, max(t1-1,0)), f"{t1}%+", "—")
+        return ("0–100%", "—", "—")
+
     return (*_legend_bins_for_zone(1), *_legend_bins_for_zone(6), *_legend_bins_for_zone(12))
 
 
@@ -5325,7 +5361,7 @@ def _set_marker_opacity_on_fig(fig_dict, sel_coords):
 
 
 # ===== INSTANT fade controller — only tweaks the existing figure =====
-@app.callback(
+@callback(
     Output("shot_chart", "figure", allow_duplicate=True),
     Input("sel_pos", "data"),           # [] on Close, [(x,y)] when viewing details
     State("shot_chart", "figure"),
@@ -5338,7 +5374,7 @@ def instant_fade(sel_coords, fig):
 
 
 # ===== Close button clears selection (triggers instant_fade to restore colors) =====
-@app.callback(
+@callback(
     Output("sel_pos", "data", allow_duplicate=True),
     Input("btn_close_shot", "n_clicks"),
     prevent_initial_call=True
@@ -5351,20 +5387,25 @@ def _clear_sel_store(_n):
 
 #------------------------------------Section 8---------------------------------------
 
-# ===== details panel =====
-@app.callback(
-    [Output("shot_details", "children"),
-     Output("sel_pos", "data")],
-    [Input("shot_chart", "clickData"),
-     Input({"type":"close_details","idx":ALL}, "n_clicks")],
+from dash import html, no_update, Output, Input, State, ALL, callback, ctx
+import re
+
+# ===== details panel (click a shot to open) =====
+@callback(
+    Output("shot_details", "children"),
+    Output("sel_pos", "data", allow_duplicate=True),   # <- allow duplicate: Section 7 also writes to sel_pos
+    Input("shot_chart", "clickData"),
+    Input({"type": "close_details", "idx": ALL}, "n_clicks"),
     prevent_initial_call=False
 )
 def show_shot_details(clickData, close_clicks):
-    ctx = callback_context
-    if ctx and ctx.triggered and "close_details" in ctx.triggered[0]["prop_id"]:
+    # If the "Close" button triggered, clear the panel and selection.
+    trg = ctx.triggered_id
+    if isinstance(trg, dict) and trg.get("type") == "close_details":
         return ("", [])
 
     try:
+        # Need a clicked point to proceed.
         if not clickData or "points" not in clickData or not clickData["points"]:
             return no_update, no_update
 
@@ -5375,11 +5416,12 @@ def show_shot_details(clickData, close_clicks):
         if not rows_for_plot:
             return no_update, no_update
 
+        # Find the nearest recorded shot to the click
         def dist2(r):
-            return (r["x"] - x_clicked)**2 + (r["y"] - y_clicked)**2
+            return (r["x"] - x_clicked) ** 2 + (r["y"] - y_clicked) ** 2
         r = sorted(rows_for_plot, key=dist2)[0]
 
-        idx = r.get("shot_index")
+        idx = r.get("shot_index") or 1
         total = r.get("group_size")
         gid_key = r.get("group_id") or r.get("timestamp") or r.get("id")
 
@@ -5391,28 +5433,29 @@ def show_shot_details(clickData, close_clicks):
             total = sum(1 for rr in rows_for_plot if same_possession(rr))
         shot_num_display = f"{int(idx)}/{int(total)}" if (idx and total) else (str(idx) if idx else "")
 
+        # All shot coords in the possession (to highlight on chart)
         pos_coords = [(rr["x"], rr["y"]) for rr in rows_for_plot if same_possession(rr)]
 
         # Sources
         pbp_names_src = (r.get("play_by_play_names") or "")
         pbp_raw_src   = (r.get("play_by_play") or "")
         pbp_src_for_roles = pbp_names_src or pbp_raw_src
-        short = r.get("shorthand") or ""  # <<< use dedicated shorthand field
+        short = r.get("shorthand") or ""
 
         # Roles from PBP (fallbacks to row fields)
-        shooter, onball_def, assister, screen_ast_list, action_lines = extract_roles_for_shot(pbp_src_for_roles, idx or 1)
+        shooter, onball_def, assister, screen_ast_list, action_lines = extract_roles_for_shot(pbp_src_for_roles, idx)
 
-        _def_disp_from_shot_line = shot_defender_display(pbp_src_for_roles, idx or 1)
+        _def_disp_from_shot_line = shot_defender_display(pbp_src_for_roles, idx)
         if _def_disp_from_shot_line:
             onball_def = _def_disp_from_shot_line
 
-        _shot_out_of_help = shot_has_help(pbp_src_for_roles, idx or 1)
+        _shot_out_of_help = shot_has_help(pbp_src_for_roles, idx)
 
         onball_actions = parse_onball_actions_from_pbp(action_lines, (screen_ast_list[0] if screen_ast_list else ""))
         onball_actions = _patch_bring_over_halfcourt(onball_actions, pbp_src_for_roles)
         offball_actions = parse_offball_actions_from_pbp(action_lines)
 
-        # ---- Only keep on-ball actions connected to THIS SHOT's shooter
+        # ---- Keep only on-ball actions connected to THIS SHOT's shooter
         def _connected_to_shooter(a, shooter_name: str) -> bool:
             s = (shooter_name or "").strip().lower()
             if not s:
@@ -5423,7 +5466,6 @@ def show_shot_details(clickData, close_clicks):
                 a.get("receiver",""), a.get("receiver_def",""),
                 a.get("intended",""), a.get("intended_def",""),
                 a.get("giver",""), a.get("giver_def",""),
-                a.get("screener",""), a.get("screener_def","")
             ]
             for srec in (a.get("screeners") or []):
                 cand_fields.append(srec.get("name",""))
@@ -5500,7 +5542,7 @@ def show_shot_details(clickData, close_clicks):
             if t not in _screen_handoff_types and a.get("coverages"):
                 a["coverages"] = [c for c in a["coverages"] if (c.get("cov") != "sw")]
 
-        # If PBP text mentions "screen assist", prefer screeners inferred from actions
+        # If PBP text mentions "screen assist", prefer inferred screeners
         sa_phrase = "screen assist" in ((pbp_names_src or pbp_raw_src or "").lower())
         if sa_phrase:
             scr_from_actions = []
@@ -5593,21 +5635,20 @@ def show_shot_details(clickData, close_clicks):
 
         # Defense label (prefer parsed; allow shorthand override if tags like 2-3[...])
         try:
-            def_label = defense_label_for_shot(pbp_src_for_roles, idx or 1) or "Man to Man"
+            def_label = defense_label_for_shot(pbp_src_for_roles, idx) or "Man to Man"
         except Exception:
             def_label = "Man to Man"
         if "[" in short and "]" in short:
             m_zone = re.search(r"\b(\d(?:-\d){1,3})\s*\[", short)
             def_label = f"{m_zone.group(1)} Zone" if m_zone else def_label
 
-        # Participants (use pbp + shorthand)
+        # Participants (from pbp + shorthand)
         try:
             _op, _dp = participants_for_possession(pbp_src_for_roles, short)
         except Exception:
             _op, _dp = ([], [])
 
-        op_list = []
-        seen_op = set()
+        op_list, seen_op = [], set()
         for nm in (_op or []):
             nm = _strip_trailing_modifiers(nm)
             nn = _norm_block(nm, roster_full_list)
@@ -5615,8 +5656,7 @@ def show_shot_details(clickData, close_clicks):
             if nn and k not in seen_op:
                 seen_op.add(k); op_list.append(nn)
 
-        dp_list = []
-        seen_dp = set()
+        dp_list, seen_dp = [], set()
         for nm in (_dp or []):
             nm = _strip_trailing_modifiers(nm)
             nn = _norm_block(nm, roster_full_list)
@@ -5672,7 +5712,6 @@ def show_shot_details(clickData, close_clicks):
         if _shot_out_of_help and not _multi_defenders:
             ident_rows.append(("Out of help", "Yes"))
 
-        # Specials: use shorthand, merged with PBP block detections
         specials_rows = special_stats_with_pbp_blocks(short, pbp_src_for_roles) or []
 
         def _clean_display_name(tok: str) -> str:
@@ -5693,8 +5732,7 @@ def show_shot_details(clickData, close_clicks):
         for row in (specials_rows or []):
             lbl = row.get("label", "")
             raw_players = row.get("players", []) or []
-            names = []
-            seen = set()
+            names, seen = [], set()
             for p in raw_players:
                 nn = _clean_display_name(p)
                 k = (nn or "").lower()
@@ -5703,13 +5741,11 @@ def show_shot_details(clickData, close_clicks):
             if lbl and names:
                 _spec_by_label[lbl] = names
 
-        # Add extra inferences from PBP free text (names) where useful
+        # Extra inferences from free text
         txt_for_infer = _clean_frag(pbp_names_src or pbp_raw_src or "")
         if txt_for_infer:
             _DEFLECT_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+deflects\b", re.IGNORECASE)
-            def_names = []
-            for m in re.finditer(_DEFLECT_SUBJ_RE, txt_for_infer):
-                def_names.append(_clean_display_name(m.group(1)))
+            def_names = [_clean_display_name(m.group(1)) for m in re.finditer(_DEFLECT_SUBJ_RE, txt_for_infer)]
             if def_names:
                 base = _spec_by_label.get("Deflection", [])
                 base_l = {b.lower() for b in base}
@@ -5719,11 +5755,8 @@ def show_shot_details(clickData, close_clicks):
 
             _STEAL_SUBJ_RE    = re.compile(rf"({_FULLNAME})\s+(?:steal(?:s|ed)?|stole)\b", re.IGNORECASE)
             _STEAL_PASSIVE_RE = re.compile(rf"\bsteal(?:s|ed)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
-            stl_names = []
-            for m in re.finditer(_STEAL_SUBJ_RE, txt_for_infer):
-                stl_names.append(_clean_display_name(m.group(1)))
-            for m in re.finditer(_STEAL_PASSIVE_RE, txt_for_infer):
-                stl_names.append(_clean_display_name(m.group(1)))
+            stl_names = [_clean_display_name(m.group(1)) for m in re.finditer(_STEAL_SUBJ_RE, txt_for_infer)]
+            stl_names += [_clean_display_name(m.group(1)) for m in re.finditer(_STEAL_PASSIVE_RE, txt_for_infer)]
             if stl_names:
                 base = _spec_by_label.get("Steal", [])
                 base_l = {b.lower() for b in base}
@@ -5733,11 +5766,8 @@ def show_shot_details(clickData, close_clicks):
 
             _OFF_FOUL_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+commits\s+an?\s+offensive\s+foul\b", re.IGNORECASE)
             _OFF_FOUL_BY_RE   = re.compile(rf"\boffensive\s+foul\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
-            off_foul_names = []
-            for m in re.finditer(_OFF_FOUL_SUBJ_RE, txt_for_infer):
-                off_foul_names.append(_clean_display_name(m.group(1)))
-            for m in re.finditer(_OFF_FOUL_BY_RE, txt_for_infer):
-                off_foul_names.append(_clean_display_name(m.group(1)))
+            off_foul_names = [_clean_display_name(m.group(1)) for m in re.finditer(_OFF_FOUL_SUBJ_RE, txt_for_infer)]
+            off_foul_names += [_clean_display_name(m.group(1)) for m in re.finditer(_OFF_FOUL_BY_RE, txt_for_infer)]
             if off_foul_names:
                 base = _spec_by_label.get("Offensive Foul", [])
                 base_l = {b.lower() for b in base}
@@ -5747,11 +5777,8 @@ def show_shot_details(clickData, close_clicks):
 
             _DEF_FOUL_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+commits\s+an?\s+defensive\s+foul\b", re.IGNORECASE)
             _DEF_FOUL_BY_RE   = re.compile(rf"\bdefensive\s+foul\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
-            def_foul_names = []
-            for m in re.finditer(_DEF_FOUL_SUBJ_RE, txt_for_infer):
-                def_foul_names.append(_clean_display_name(m.group(1)))
-            for m in re.finditer(_DEF_FOUL_BY_RE, txt_for_infer):
-                def_foul_names.append(_clean_display_name(m.group(1)))
+            def_foul_names = [_clean_display_name(m.group(1)) for m in re.finditer(_DEF_FOUL_SUBJ_RE, txt_for_infer)]
+            def_foul_names += [_clean_display_name(m.group(1)) for m in re.finditer(_DEF_FOUL_BY_RE, txt_for_infer)]
             if def_foul_names:
                 base = _spec_by_label.get("Defensive Foul", [])
                 base_l = {b.lower() for b in base}
@@ -5759,7 +5786,7 @@ def show_shot_details(clickData, close_clicks):
                 if merged:
                     _spec_by_label["Defensive Foul"] = merged
 
-        # Ensure Block appears once in the identity list
+        # Add “Block” once in identity if present
         ident_rows_ext = list(ident_rows)
         if _spec_by_label.get("Block"):
             ident_rows_ext.append(("Block", ", ".join(_spec_by_label["Block"])))
@@ -5796,10 +5823,30 @@ def show_shot_details(clickData, close_clicks):
             )
         ])
 
+        # Final composed panel + selection coords for chart highlight
         return html.Div([
-            top_close,
+            html.Div(  # Close button
+                html.Button(
+                    "Close",
+                    id={"type":"close_details","idx":0},
+                    n_clicks=0,
+                    style={"padding":"6px 10px","borderRadius":"8px","border":"1px solid #aaa","background":"white"}
+                ),
+                style={"display":"flex","justifyContent":"flex-end","marginBottom":"6px"}
+            ),
             pre,
-            header,
+            html.Div([
+                html.Div([
+                    html.Span("Shot details", style={"fontWeight":700,"fontSize":"18px","marginRight":"8px"}),
+                    html.Span(f"({shot_num_display})" if shot_num_display else "", style={"color":"#666"}),
+                    html.Span(f" • Defense: {def_label}", style={"marginLeft":"6px","color":"#444"}),
+                    html.Span(f" • Result: {r.get('result','')}", style={"marginLeft":"6px","color":"#444"}),
+                ]),
+                html.Div([
+                    html.Span(f"Practice: {practice}" if (practice := (r.get('practice_date_str') or '')) else "", style={"marginRight":"16px","color":"#555"}),
+                    html.Span(f"Drill: {r.get('drill') or ''}", style={"color":"#555"}),
+                ]),
+            ], style={"display":"flex","justifyContent":"space-between","alignItems":"center","flexWrap":"wrap","gap":"10px"}),
             identity,
             html.Div([html.Div("On-ball Actions", style={"fontWeight":700,"margin":"6px 0"}), *oblocks]) if oblocks else html.Div(),
             html.Div([html.Div("Off-ball Actions", style={"fontWeight":700,"margin":"10px 0 6px"}), *fblocks]) if fblocks else html.Div(),
@@ -5807,6 +5854,7 @@ def show_shot_details(clickData, close_clicks):
 
     except Exception as e:
         return html.Div(f"Error: {e}", style={"color":"crimson"}), []
+
 
 
 if __name__ == "__main__":
