@@ -5396,7 +5396,7 @@ import re
     Output("sel_pos", "data", allow_duplicate=True),   # <- allow duplicate: Section 7 also writes to sel_pos
     Input("shot_chart", "clickData"),
     Input({"type": "close_details", "idx": ALL}, "n_clicks"),
-    prevent_initial_call=False
+    prevent_initial_call=True
 )
 def show_shot_details(clickData, close_clicks):
     # If the "Close" button triggered, clear the panel and selection.
