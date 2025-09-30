@@ -11,28 +11,18 @@ from flask import Response
 log = logging.getLogger(__name__)
 
 # =========================
-# App (title + expose Flask server)
+# Resolve absolute data paths from THIS file (works on Windows + Linux)
 # =========================
-app = Dash(
-    __name__,
-    title="CWB Practice Stats",
-    suppress_callback_exceptions=True,
-    # Make sure Dash’s routes line up on Render
-    requests_pathname_prefix="/",
-    serve_locally=True,   # serve component bundles from this app (not CDN)
-)
-server = app.server
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# tiny health check so we know the Flask layer is alive
-@server.route("/healthz")
-def _healthz():
-    return Response("ok", mimetype="text/plain")
+def _abs_from_app(path_like: str) -> str:
+    if not path_like:
+        return ""
+    return path_like if os.path.isabs(path_like) else os.path.normpath(os.path.join(APP_DIR, path_like))
 
-# =========================
-# Config / Data paths
-# =========================
-DATA_PATH = os.environ.get("BBALL_DATA", "data/possessions.json")
-BASE_DIR = os.path.dirname(DATA_PATH) or "."
+# If BBALL_DATA is set, we’ll honor it; otherwise use repo ./data/possessions.json
+DATA_PATH = _abs_from_app(os.environ.get("BBALL_DATA", "data/possessions.json"))
+BASE_DIR = os.path.dirname(DATA_PATH) or APP_DIR
 ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
 PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
 
@@ -57,6 +47,16 @@ def _schema_keys(path, k=10):
     except Exception as e:
         print(f"[schema_keys] {path}: {e}")
     return []
+
+def _first_row_keys(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, list) and j and isinstance(j[0], dict):
+            return set(j[0].keys())
+    except Exception as e:
+        print(f"[first_row_keys] {path}: {e}")
+    return set()
 
 def _peek_json(path, limit=2):
     try:
@@ -84,14 +84,31 @@ for p in (DATA_PATH, ROSTER_PATH, PRACTICES_PATH):
     except Exception as _e:
         print(f"{p} exists={os.path.exists(p)} size=? err={_e}")
 print(f"[COUNTS] possessions={_count_json(DATA_PATH)}, roster={_count_json(ROSTER_PATH)}, practices={_count_json(PRACTICES_PATH)}")
+print(f"[SCHEMA] poss keys: {sorted(list(_first_row_keys(DATA_PATH)))[:20]}")
 _peek_json(DATA_PATH)
 print("================================")
 
-# Expose a short status string you can render under the H1 (optional)
+# Optional status string you can render under the H1
 STATUS_TEXT = (
-    f"Data source: {DATA_PATH}  •  rows={_count_json(DATA_PATH)}  "
+    f"Data source: {os.path.relpath(DATA_PATH, APP_DIR)}  •  rows={_count_json(DATA_PATH)}  "
     f"•  sample keys: {', '.join(_schema_keys(DATA_PATH, k=8)) or 'unknown'}"
 )
+
+# =========================
+# App (title + expose Flask server)
+# =========================
+app = Dash(
+    __name__,
+    title="CWB Practice Stats",
+    suppress_callback_exceptions=True,
+    serve_locally=True,   # serve component bundles from this app (not CDN)
+)
+server = app.server
+
+# tiny health check so we know the Flask layer is alive
+@server.route("/healthz")
+def _healthz():
+    return Response("ok", mimetype="text/plain")
 
 # =========================
 # Layout wiring (use the REAL layout, fail gracefully)
@@ -103,23 +120,22 @@ def _safe_serve_layout():
     """
     try:
         return serve_layout()  # <-- your real layout function defined later
-    except Exception as e:
+    except Exception:
         import traceback
         log.exception("serve_layout failed during app start")
         return html.Div(
             [
                 html.H1("CWB Practice Stats"),
                 html.Div("The main layout failed to load. Check server logs for details."),
+                html.Pre(STATUS_TEXT),
                 html.Pre(traceback.format_exc()),
-                html.Hr(),
-                html.Pre(f"DATA_PATH={DATA_PATH}\nROSTER_PATH={ROSTER_PATH}\nPRACTICES_PATH={PRACTICES_PATH}\n"
-                         f"possessions rows={_count_json(DATA_PATH)}  roster entries={_count_json(ROSTER_PATH)}"),
             ],
             style={"padding": "2rem", "fontFamily": "system-ui, Arial, sans-serif"},
         )
 
 # IMPORTANT: point Dash at the safe, real layout (replaces any build_layout)
 app.layout = _safe_serve_layout
+
 
 # Court geometry (must match entry app exactly)
 COURT_W = 50.0
