@@ -4258,11 +4258,13 @@ def serve_layout():
                 ]),
             ]),
 
-            # ---- state stores (used by callbacks in Sections 6–8)
+           # ---- state stores (used by callbacks in Sections 6–8)
             dcc.Store(id="sel_pos", data=[]),
             dcc.Store(id="filters_shoot_state"),
             dcc.Store(id="filters_stats_state"),
             dcc.Store(id="options_cache", data={}),
+            dcc.Interval(id="init_pulse", interval=1, n_intervals=0, max_intervals=1),
+
         ]
     )
 
