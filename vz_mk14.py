@@ -1,29 +1,25 @@
 # ------------------SECTION 1--------------------------------------------------
 # vz_mk5 — adds shooting stats and stats table, adds filters
 
-import os
-import json
-import math
-import re
+import os, json, math, re, logging
 import numpy as np
 import dash
 from dash import Dash, html, dcc, Output, Input, State, no_update, callback_context, ALL
 import plotly.graph_objects as go
+from flask import Response
+
+log = logging.getLogger(__name__)
 
 # =========================
 # App (title + expose Flask server)
 # =========================
-from flask import Response
-import logging
-log = logging.getLogger(__name__)
-
 app = Dash(
     __name__,
     title="CWB Practice Stats",
     suppress_callback_exceptions=True,
-    # These two lines make sure Dash’s JS/CSS routes line up on Render
+    # Make sure Dash’s routes line up on Render
     requests_pathname_prefix="/",
-    serve_locally=True,  # serve component bundles from this app (not CDN)
+    serve_locally=True,   # serve component bundles from this app (not CDN)
 )
 server = app.server
 
@@ -32,6 +28,74 @@ server = app.server
 def _healthz():
     return Response("ok", mimetype="text/plain")
 
+# =========================
+# Config / Data paths
+# =========================
+DATA_PATH = os.environ.get("BBALL_DATA", "data/possessions.json")
+BASE_DIR = os.path.dirname(DATA_PATH) or "."
+ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
+PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
+
+# --- DIAGNOSTICS: prove what prod is actually reading ---
+def _count_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, list):  return len(j)
+        if isinstance(j, dict):  return len(j)
+        return -1
+    except Exception as e:
+        print(f"[count_json] {path}: {e}")
+        return -1
+
+def _schema_keys(path, k=10):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, list) and j and isinstance(j[0], dict):
+            return list(j[0].keys())[:k]
+    except Exception as e:
+        print(f"[schema_keys] {path}: {e}")
+    return []
+
+def _peek_json(path, limit=2):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        rows = data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[PEEK] failed to load {path}: {e}")
+        return
+    keys_union = set()
+    for r in rows[:limit]:
+        if isinstance(r, dict):
+            keys_union.update(r.keys())
+    print("=== DATA DIAGNOSTIC ===")
+    print(f"[PATH] {path}")
+    print(f"[EXISTS] {os.path.exists(path)} size={os.path.getsize(path) if os.path.exists(path) else 0}")
+    print(f"[COUNT] {len(rows)}")
+    print(f"[SAMPLE KEYS] {sorted(list(keys_union))}")
+    print("=======================")
+
+print("=== Startup data check ===")
+for p in (DATA_PATH, ROSTER_PATH, PRACTICES_PATH):
+    try:
+        print(f"{p} exists={os.path.exists(p)} size={os.path.getsize(p) if os.path.exists(p) else 0}")
+    except Exception as _e:
+        print(f"{p} exists={os.path.exists(p)} size=? err={_e}")
+print(f"[COUNTS] possessions={_count_json(DATA_PATH)}, roster={_count_json(ROSTER_PATH)}, practices={_count_json(PRACTICES_PATH)}")
+_peek_json(DATA_PATH)
+print("================================")
+
+# Expose a short status string you can render under the H1 (optional)
+STATUS_TEXT = (
+    f"Data source: {DATA_PATH}  •  rows={_count_json(DATA_PATH)}  "
+    f"•  sample keys: {', '.join(_schema_keys(DATA_PATH, k=8)) or 'unknown'}"
+)
+
+# =========================
+# Layout wiring (use the REAL layout, fail gracefully)
+# =========================
 def _safe_serve_layout():
     """
     Use the full UI builder (serve_layout) but never let an import-time error
@@ -47,38 +111,15 @@ def _safe_serve_layout():
                 html.H1("CWB Practice Stats"),
                 html.Div("The main layout failed to load. Check server logs for details."),
                 html.Pre(traceback.format_exc()),
+                html.Hr(),
+                html.Pre(f"DATA_PATH={DATA_PATH}\nROSTER_PATH={ROSTER_PATH}\nPRACTICES_PATH={PRACTICES_PATH}\n"
+                         f"possessions rows={_count_json(DATA_PATH)}  roster entries={_count_json(ROSTER_PATH)}"),
             ],
             style={"padding": "2rem", "fontFamily": "system-ui, Arial, sans-serif"},
         )
 
-# IMPORTANT: point Dash at the safe, real layout (no build_layout)
+# IMPORTANT: point Dash at the safe, real layout (replaces any build_layout)
 app.layout = _safe_serve_layout
-
-# =========================
-# Config
-# =========================
-DATA_PATH = os.environ.get("BBALL_DATA", "data/possessions.json")
-BASE_DIR    = os.path.dirname(DATA_PATH) or "."
-ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
-PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
-
-# --- visibility in Render logs ---
-def _count_json(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        if isinstance(j, list):  return len(j)
-        if isinstance(j, dict):  return len(j)
-        return -1
-    except Exception as e:
-        print(f"[count_json] {path}: {e}")
-        return -1
-
-print(f"[PATHS] DATA_PATH={DATA_PATH} exists={os.path.exists(DATA_PATH)}")
-print(f"[PATHS] ROSTER_PATH={ROSTER_PATH} exists={os.path.exists(ROSTER_PATH)}")
-print(f"[PATHS] PRACTICES_PATH={PRACTICES_PATH} exists={os.path.exists(PRACTICES_PATH)}")
-print(f"[COUNTS] possessions={_count_json(DATA_PATH)}, roster={_count_json(ROSTER_PATH)}, practices={_count_json(PRACTICES_PATH)}")
-
 
 # Court geometry (must match entry app exactly)
 COURT_W = 50.0
