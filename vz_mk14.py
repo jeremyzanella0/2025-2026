@@ -4323,6 +4323,17 @@ from uuid import uuid4
 import re, os, json, math, copy
 
 
+
+# --- sanity ping: proves callbacks are wired in prod ---
+from dash import callback, Output, Input
+
+@callback(Output("status", "children"), Input("tabs", "value"), prevent_initial_call=False)
+def _ping_callbacks(tab):
+    return "callbacks are alive"
+
+
+
+
 def _parse_date_any(s):
     if not s: return None
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
