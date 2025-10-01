@@ -7,86 +7,139 @@ import dash
 from dash import Dash, html, dcc, Output, Input, State, no_update, callback_context, ALL
 import plotly.graph_objects as go
 from flask import Response
+import requests  # needed if any data paths are HTTP(S) URLs
 
 log = logging.getLogger(__name__)
 
 # =========================
 # Resolve absolute data paths from THIS file (works on Windows + Linux)
+# Also supports HTTP(S) URLs via env vars.
 # =========================
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def _is_url(s: str) -> bool:
+    return isinstance(s, str) and s.lower().startswith(("http://", "https://"))
+
 def _abs_from_app(path_like: str) -> str:
+    """
+    If path_like is a URL, return as-is.
+    If it's empty/None, return empty string.
+    Otherwise make it absolute relative to this file.
+    """
     if not path_like:
         return ""
+    if _is_url(path_like):
+        return path_like
     return path_like if os.path.isabs(path_like) else os.path.normpath(os.path.join(APP_DIR, path_like))
 
-# If BBALL_DATA is set, we’ll honor it; otherwise use repo ./data/possessions.json
-DATA_PATH = _abs_from_app(os.environ.get("BBALL_DATA", "data/possessions.json"))
-BASE_DIR = os.path.dirname(DATA_PATH) or APP_DIR
-ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
-PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
+def _resolve_data_src(env_key: str, default_rel: str) -> str:
+    """
+    Resolve a source from env var or fallback to a repo-relative file path.
+    Handles URLs correctly.
+    """
+    return _abs_from_app(os.environ.get(env_key, default_rel))
 
-# --- DIAGNOSTICS: prove what prod is actually reading ---
-def _count_json(path):
+# Allow overriding all three via env vars
+DATA_PATH       = _resolve_data_src("BBALL_DATA",       "data/possessions.json")
+ROSTER_PATH     = _resolve_data_src("BBALL_ROSTER",     "data/roster.json")
+PRACTICES_PATH  = _resolve_data_src("BBALL_PRACTICES",  "data/practices.json")
+
+# --- DATA LOADER UTILITIES ----------------------------------------------------
+
+def _load_json_any(src):
+    """
+    Load JSON from a local file path or HTTP(S) URL.
+    Returns the parsed JSON (list or dict). Raises on errors.
+    """
+    if _is_url(src):
+        r = requests.get(src, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    else:
+        with open(src, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+def safe_load_data(src=DATA_PATH):
+    """
+    Safely load possessions as a list of dicts. If JSON is a dict, coerce to [].
+    """
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            j = json.load(f)
+        data = _load_json_any(src)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            # Some writers wrap rows under a key; try common keys, else fallback to []
+            for key in ("rows", "data", "possessions", "items"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+            return []
+        return []
+    except Exception as e:
+        print(f"[safe_load_data] failed to load {src}: {e}")
+        return []
+
+def _count_json(src) -> int:
+    try:
+        j = _load_json_any(src)
         if isinstance(j, list):  return len(j)
         if isinstance(j, dict):  return len(j)
         return -1
     except Exception as e:
-        print(f"[count_json] {path}: {e}")
+        print(f"[count_json] {src}: {e}")
         return -1
 
-def _schema_keys(path, k=10):
+def _first_row_keys(src):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        if isinstance(j, list) and j and isinstance(j[0], dict):
-            return list(j[0].keys())[:k]
-    except Exception as e:
-        print(f"[schema_keys] {path}: {e}")
-    return []
-
-def _first_row_keys(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            j = json.load(f)
+        j = _load_json_any(src)
         if isinstance(j, list) and j and isinstance(j[0], dict):
             return set(j[0].keys())
     except Exception as e:
-        print(f"[first_row_keys] {path}: {e}")
+        print(f"[first_row_keys] {src}: {e}")
     return set()
 
-def _peek_json(path, limit=2):
+def _schema_keys(src, k=10):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        rows = data if isinstance(data, list) else []
+        j = _load_json_any(src)
+        if isinstance(j, list) and j and isinstance(j[0], dict):
+            return list(j[0].keys())[:k]
     except Exception as e:
-        print(f"[PEEK] failed to load {path}: {e}")
+        print(f"[schema_keys] {src}: {e}")
+    return []
+
+def _peek_json(src, limit=2):
+    try:
+        data = safe_load_data(src)
+    except Exception as e:
+        print(f"[PEEK] failed to load {src}: {e}")
         return
     keys_union = set()
-    for r in rows[:limit]:
+    for r in data[:limit]:
         if isinstance(r, dict):
             keys_union.update(r.keys())
     print("=== DATA DIAGNOSTIC ===")
-    print(f"[PATH] {path}")
-    print(f"[EXISTS] {os.path.exists(path)} size={os.path.getsize(path) if os.path.exists(path) else 0}")
-    print(f"[COUNT] {len(rows)}")
+    print(f"[SRC] {src}")
+    if _is_url(src):
+        try:
+            h = requests.head(src, timeout=5)
+            clen = h.headers.get("Content-Length", "?")
+            print(f"[URL] status={h.status_code} content-length={clen}")
+        except Exception as e:
+            print(f"[URL] HEAD failed: {e}")
+    else:
+        print(f"[EXISTS] {os.path.exists(src)} size={os.path.getsize(src) if os.path.exists(src) else 0}")
+    print(f"[COUNT] {len(data)}")
     print(f"[SAMPLE KEYS] {sorted(list(keys_union))}")
     print("=======================")
 
-def _parse_probe(path):
+def _parse_probe(src):
     """Print the raw fields the parser relies on for the first possession."""
     print("=== PARSE PROBE (first possession) ===")
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        rows = safe_load_data(src)
+        if not rows:
             print("[PARSE PROBE] No possessions loaded or wrong format.")
         else:
-            row0 = data[0]
+            row0 = rows[0]
             print("[PBP]", row0.get("play_by_play"))
             print("[PBP_NAMES]", row0.get("play_by_play_names"))
             print("[POSSESSION]", row0.get("possession"))
@@ -96,12 +149,22 @@ def _parse_probe(path):
         print("[PARSE PROBE ERROR]", e)
     print("======================================")
 
+# --- DIAGNOSTICS @ IMPORT -----------------------------------------------------
 print("=== Startup data check ===")
-for p in (DATA_PATH, ROSTER_PATH, PRACTICES_PATH):
+for src in (DATA_PATH, ROSTER_PATH, PRACTICES_PATH):
     try:
-        print(f"{p} exists={os.path.exists(p)} size={os.path.getsize(p) if os.path.exists(p) else 0}")
+        if _is_url(src):
+            # Try a lightweight HEAD
+            try:
+                h = requests.head(src, timeout=5)
+                clen = h.headers.get("Content-Length", "?")
+                print(f"{src} [URL] status={h.status_code} content-length={clen}")
+            except Exception as e:
+                print(f"{src} [URL HEAD error] {e}")
+        else:
+            print(f"{src} exists={os.path.exists(src)} size={os.path.getsize(src) if os.path.exists(src) else 0}")
     except Exception as _e:
-        print(f"{p} exists={os.path.exists(p)} size=? err={_e}")
+        print(f"{src} exists=? size=? err={_e}")
 print(f"[COUNTS] possessions={_count_json(DATA_PATH)}, roster={_count_json(ROSTER_PATH)}, practices={_count_json(PRACTICES_PATH)}")
 print(f"[SCHEMA] poss keys: {sorted(list(_first_row_keys(DATA_PATH)))[:20]}")
 _peek_json(DATA_PATH)
@@ -110,7 +173,7 @@ print("================================")
 
 # Optional status string you can render under the H1
 STATUS_TEXT = (
-    f"Data source: {os.path.relpath(DATA_PATH, APP_DIR)}  •  rows={_count_json(DATA_PATH)}  "
+    f"Data source: {DATA_PATH}  •  rows={_count_json(DATA_PATH)}  "
     f"•  sample keys: {', '.join(_schema_keys(DATA_PATH, k=8)) or 'unknown'}"
 )
 
@@ -129,6 +192,60 @@ server = app.server
 @server.route("/healthz")
 def _healthz():
     return Response("ok", mimetype="text/plain")
+
+# ---------------- DEBUG: inspect parser on the first possession ----------------
+@server.route("/debug/first-possession")
+def _debug_first_possession():
+    try:
+        rows = safe_load_data(DATA_PATH)
+        first = rows[0] if rows else {}
+        pbp_names = (first.get("play_by_play_names") or "").strip()
+        pbp_raw   = (first.get("play_by_play") or "").strip()
+        poss      = (first.get("possession") or "").strip()
+        idx       = first.get("shot_index") or 1
+
+        # Choose best available source text for parsing
+        pbp_src = pbp_names or pbp_raw or poss
+
+        # Call your real parser if available; otherwise return placeholders.
+        shooter = onball_def = assister = ""
+        screen_asts = []
+        candidates = []
+
+        try:
+            # This function is expected to be defined later in this file.
+            # Name resolves at call time, so it's safe even though this route is declared here.
+            parsed = extract_roles_for_shot(pbp_src, idx)  # type: ignore[name-defined]
+            # Accept either a tuple or dict return, depending on your implementation
+            if isinstance(parsed, tuple) and len(parsed) >= 5:
+                shooter, onball_def, assister, screen_asts, candidates = parsed[:5]
+            elif isinstance(parsed, dict):
+                shooter       = parsed.get("shooter", "")
+                onball_def    = parsed.get("onball_defender", "")
+                assister      = parsed.get("assister", "")
+                screen_asts   = parsed.get("screen_assists", []) or []
+                candidates    = parsed.get("candidates", []) or []
+            else:
+                candidates = [f"Unexpected parse return type: {type(parsed)}"]
+        except Exception as e:
+            candidates = [f"extract_roles_for_shot error: {e}"]
+
+        payload = {
+            "pbp_names": pbp_names,
+            "pbp_raw": pbp_raw,
+            "possession": poss,
+            "shot_index": idx,
+            "parsed": {
+                "shooter": shooter,
+                "onball_defender": onball_def,
+                "assister": assister,
+                "screen_assists": screen_asts,
+                "candidates": candidates,
+            },
+        }
+        return Response(json.dumps(payload, indent=2), mimetype="application/json")
+    except Exception as e:
+        return Response(json.dumps({"error": str(e)}), mimetype="application/json", status=500)
 
 # =========================
 # Layout wiring (use the REAL layout, fail gracefully)
