@@ -7,7 +7,7 @@ import dash
 from dash import Dash, html, dcc, Output, Input, State, no_update, callback_context, ALL
 import plotly.graph_objects as go
 from flask import Response
-import requests  # allow URL data sources
+import requests  # allow HTTP(S) data sources
 
 log = logging.getLogger(__name__)
 
@@ -21,11 +21,6 @@ def _is_url(s: str) -> bool:
     return isinstance(s, str) and s.lower().startswith(("http://", "https://"))
 
 def _abs_from_app(path_like: str) -> str:
-    """
-    If path_like is a URL, return as-is.
-    If it's empty/None, return empty string.
-    Otherwise make it absolute relative to this file.
-    """
     if not path_like:
         return ""
     if _is_url(path_like):
@@ -33,10 +28,6 @@ def _abs_from_app(path_like: str) -> str:
     return path_like if os.path.isabs(path_like) else os.path.normpath(os.path.join(APP_DIR, path_like))
 
 def _resolve_data_src(env_key: str, default_rel: str) -> str:
-    """
-    Resolve a source from env var or fallback to a repo-relative file path.
-    Handles URLs correctly.
-    """
     return _abs_from_app(os.environ.get(env_key, default_rel))
 
 # Allow overriding all three via env vars
@@ -45,12 +36,8 @@ ROSTER_PATH     = _resolve_data_src("BBALL_ROSTER",     "data/roster.json")
 PRACTICES_PATH  = _resolve_data_src("BBALL_PRACTICES",  "data/practices.json")
 
 # --- DATA LOADER UTILITIES ----------------------------------------------------
-
 def _load_json_any(src):
-    """
-    Load JSON from a local file path or HTTP(S) URL.
-    Returns the parsed JSON (list or dict). Raises on errors.
-    """
+    """Load JSON from local file or HTTP(S) URL. Returns list or dict."""
     if _is_url(src):
         r = requests.get(src, timeout=10)
         r.raise_for_status()
@@ -58,6 +45,60 @@ def _load_json_any(src):
     with open(src, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def _rows_from_json_payload(payload) -> list[dict]:
+    """Normalize common shapes to list[dict]."""
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if isinstance(payload, dict):
+        for key in ("rows", "data", "possessions", "items"):
+            if key in payload and isinstance(payload[key], list):
+                return [r for r in payload[key] if isinstance(r, dict)]
+    return []
+
+# Single public accessor used by the rest of the app.
+# It caches by file mtime (local files). For URLs, it just returns latest fetch.
+_CACHED_ROWS: list[dict] = []
+_DATA_LAST_MTIME: float = 0.0
+
+def get_possession_rows_cached(src: str = DATA_PATH) -> list[dict]:
+    """Return raw possession rows with simple caching; always a NEW list (copy)."""
+    global _CACHED_ROWS, _DATA_LAST_MTIME
+    if _is_url(src):
+        try:
+            payload = _load_json_any(src)
+            _CACHED_ROWS = _rows_from_json_payload(payload)
+            return list(_CACHED_ROWS)
+        except Exception as e:
+            print(f"[get_possession_rows_cached:url] {e}")
+            return list(_CACHED_ROWS)
+
+    # local file path
+    if not os.path.exists(src):
+        return list(_CACHED_ROWS)
+    try:
+        mtime = os.path.getmtime(src)
+    except Exception:
+        return list(_CACHED_ROWS)
+
+    if mtime == _DATA_LAST_MTIME and _CACHED_ROWS:
+        return list(_CACHED_ROWS)
+
+    try:
+        payload = _load_json_any(src)
+        rows = _rows_from_json_payload(payload)
+        _CACHED_ROWS = rows
+        _DATA_LAST_MTIME = mtime
+        return list(rows)
+    except Exception as e:
+        print(f"[get_possession_rows_cached:file] {e}")
+        return list(_CACHED_ROWS)
+
+# ---- Back-compat alias so older code keeps working ---------------------------
+def safe_load_data() -> list[dict]:
+    """Compatibility alias: return raw possession rows (cached)."""
+    return get_possession_rows_cached()
+
+# --- DIAGNOSTICS: prove what prod is actually reading -------------------------
 def _count_json(src) -> int:
     try:
         j = _load_json_any(src)
@@ -73,6 +114,9 @@ def _first_row_keys(src):
         j = _load_json_any(src)
         if isinstance(j, list) and j and isinstance(j[0], dict):
             return set(j[0].keys())
+        if isinstance(j, dict):
+            rows = _rows_from_json_payload(j)
+            return set(rows[0].keys()) if rows else set()
     except Exception as e:
         print(f"[first_row_keys] {src}: {e}")
     return set()
@@ -80,78 +124,21 @@ def _first_row_keys(src):
 def _schema_keys(src, k=10):
     try:
         j = _load_json_any(src)
-        if isinstance(j, list) and j and isinstance(j[0], dict):
-            return list(j[0].keys())[:k]
+        rows = _rows_from_json_payload(j) if isinstance(j, dict) else (j if isinstance(j, list) else [])
+        if rows and isinstance(rows[0], dict):
+            return list(rows[0].keys())[:k]
     except Exception as e:
         print(f"[schema_keys] {src}: {e}")
     return []
 
-# -------- Single, canonical possessions loader (replaces duplicate safe_load_data) -----
-_CACHED_ROWS = []
-_DATA_LAST_MTIME = None  # local files only
-
-def load_possessions_cached(src=DATA_PATH, use_cache=True):
-    """
-    Load possessions as a list[dict].
-    - Local file: cache by mtime.
-    - URL: no mtime; light cache if use_cache=True (keeps last good).
-    Returns [] on failure.
-    """
-    global _CACHED_ROWS, _DATA_LAST_MTIME
-
-    # URL source: just try to fetch; if it fails, fall back to cache.
-    if _is_url(src):
-        if not use_cache:
-            try:
-                j = _load_json_any(src)
-                rows = j.get("rows", j) if isinstance(j, dict) else j
-                rows = [r for r in (rows or []) if isinstance(r, dict)]
-                _CACHED_ROWS = rows
-                return list(rows)
-            except Exception as e:
-                print(f"[load_possessions_cached][URL fresh] {e}")
-                return list(_CACHED_ROWS)
-        # cached path
-        try:
-            j = _load_json_any(src)
-            rows = j.get("rows", j) if isinstance(j, dict) else j
-            rows = [r for r in (rows or []) if isinstance(r, dict)]
-            _CACHED_ROWS = rows
-            return list(rows)
-        except Exception as e:
-            print(f"[load_possessions_cached][URL cached] {e}")
-            return list(_CACHED_ROWS)
-
-    # Local file path
-    if not os.path.exists(src):
-        return list(_CACHED_ROWS)
-    try:
-        mtime = os.path.getmtime(src)
-    except Exception:
-        return list(_CACHED_ROWS)
-
-    if use_cache and _DATA_LAST_MTIME == mtime and _CACHED_ROWS:
-        return list(_CACHED_ROWS)
-
-    try:
-        j = _load_json_any(src)
-        rows = j.get("rows", j) if isinstance(j, dict) else j
-        rows = [r for r in (rows or []) if isinstance(r, dict)]
-        _CACHED_ROWS = rows
-        _DATA_LAST_MTIME = mtime
-        return list(rows)
-    except Exception as e:
-        print(f"[load_possessions_cached][local] {e}")
-        return list(_CACHED_ROWS)
-
 def _peek_json(src, limit=2):
     try:
-        data = load_possessions_cached(src, use_cache=False)
+        rows = get_possession_rows_cached(src)
     except Exception as e:
         print(f"[PEEK] failed to load {src}: {e}")
         return
     keys_union = set()
-    for r in data[:limit]:
+    for r in rows[:limit]:
         if isinstance(r, dict):
             keys_union.update(r.keys())
     print("=== DATA DIAGNOSTIC ===")
@@ -165,7 +152,7 @@ def _peek_json(src, limit=2):
             print(f"[URL] HEAD failed: {e}")
     else:
         print(f"[EXISTS] {os.path.exists(src)} size={os.path.getsize(src) if os.path.exists(src) else 0}")
-    print(f"[COUNT] {len(data)}")
+    print(f"[COUNT] {len(rows)}")
     print(f"[SAMPLE KEYS] {sorted(list(keys_union))}")
     print("=======================")
 
@@ -173,7 +160,7 @@ def _parse_probe(src):
     """Print the raw fields the parser relies on for the first possession."""
     print("=== PARSE PROBE (first possession) ===")
     try:
-        rows = load_possessions_cached(src, use_cache=False)
+        rows = get_possession_rows_cached(src)
         if not rows:
             print("[PARSE PROBE] No possessions loaded or wrong format.")
         else:
@@ -186,18 +173,6 @@ def _parse_probe(src):
     except Exception as e:
         print("[PARSE PROBE ERROR]", e)
     print("======================================")
-
-
-# --- Back-compat loader alias (so older code calling safe_load_data keeps working) ---
-def safe_load_data(path_like: str | None = None):
-    """
-    Back-compat wrapper around load_possessions_cached.
-    Returns a list[dict] of possession rows.
-    Accepts optional path; defaults to DATA_PATH.
-    """
-    src = path_like if path_like else DATA_PATH
-    return load_possessions_cached(src, use_cache=True)
-
 
 # --- DIAGNOSTICS @ IMPORT -----------------------------------------------------
 print("=== Startup data check ===")
@@ -242,45 +217,271 @@ server = app.server
 def _healthz():
     return Response("ok", mimetype="text/plain")
 
+# =========================
+# Court geometry (must match entry app exactly)
+# =========================
+COURT_W = 50.0
+HALF_H = 47.0
+RIM_X, RIM_Y, RIM_R = 25.0, 4.25, 0.75
+BACKBOARD_Y, RESTRICTED_R = 3.0, 4.0
+LANE_W, FT_CY, FT_R = 16.0, 19.0, 6.0
+LANE_X0, LANE_X1 = RIM_X - LANE_W/2.0, RIM_X + LANE_W/2.0
+THREE_R, SIDELINE_INSET = 22.15, 3.0
+LEFT_POST_X, RIGHT_POST_X = SIDELINE_INSET, COURT_W - SIDELINE_INSET
+
+# =========================
+# Roster helpers (normalize names)
+# =========================
+def _load_roster_from_disk():
+    try:
+        if os.path.exists(ROSTER_PATH):
+            with open(ROSTER_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f) or {}
+            out = {}
+            for k, v in raw.items():
+                try:
+                    kk = str(int(k))
+                    name = (v or "").strip()
+                    if name:
+                        out[kk] = name
+                except:
+                    continue
+            return out
+    except Exception as e:
+        print(f"[roster load] {e}")
+    return {}
+
+def _last_name(full: str) -> str:
+    parts = [p for p in re.split(r"\s+", (full or "").strip()) if p]
+    return parts[-1] if parts else (full or "")
+
+def _first_name(full: str) -> str:
+    parts = [p for p in re.split(r"\s+", (full or "").strip()) if p]
+    return parts[0] if parts else (full or "")
+
+def _build_name_maps(roster_dict: dict):
+    last_map, first_map, full_set = {}, {}, set()
+    for full in roster_dict.values():
+        ln = _last_name(full); fn = _first_name(full)
+        last_map.setdefault(ln.lower(), []).append(full)
+        first_map.setdefault(fn.lower(), []).append(full)
+        full_set.add(full.strip().lower())
+    return last_map, first_map, full_set
+
+_ROSTER_CACHE = None
+def _get_roster_cache():
+    global _ROSTER_CACHE
+    if _ROSTER_CACHE is None:
+        _ROSTER_CACHE = _load_roster_from_disk() or {}
+    return _ROSTER_CACHE
+
+def _normalize_to_roster(nm: str, roster_dict: dict | None = None) -> str:
+    nm = (nm or "").strip()
+    if not nm:
+        return nm
+    roster_dict = roster_dict or _get_roster_cache()
+    last_map, first_map, full_set = _build_name_maps(roster_dict)
+    low = nm.lower()
+
+    if " " in nm and low in full_set:
+        for full in roster_dict.values():
+            if full.strip().lower() == low:
+                return full
+
+    if " " not in nm:
+        if low in last_map and len(last_map[low]) == 1:
+            return last_map[low][0]
+        if low in first_map and len(first_map[low]) == 1:
+            return first_map[low][0]
+        subs = [full for full in roster_dict.values() if low in full.lower()]
+        if len(subs) == 1:
+            return subs[0]
+        return nm
+
+    parts = nm.split()
+    first_tok, last_tok = parts[0].lower(), parts[-1].lower()
+    cands = []
+    for full in roster_dict.values():
+        fparts = full.lower().split()
+        if fparts and fparts[0].startswith(first_tok) and fparts[-1] == last_tok:
+            cands.append(full)
+    if len(cands) == 1:
+        return cands[0]
+    return nm
+
+def _normalize_list(names):
+    roster = _get_roster_cache()
+    out, seen = [], set()
+    for n in (names or []):
+        nn = _normalize_to_roster(n, roster)
+        key = (nn or "").strip().lower()
+        if nn and key not in seen:
+            out.append(nn); seen.add(key)
+    return out
+
+# =========================
+# Parsing helpers (shooter / defender / assister)
+# =========================
+_CAP = r"[A-Z][a-zA-Z0-9.\-']+"
+_FULLNAME = rf"{_CAP}(?:\s+{_CAP})?"
+
+_SHOOT_GUARD_RE = re.compile(rf"({_FULLNAME})\s*guarded\s*by\s*({_FULLNAME})", re.IGNORECASE)
+_MAKE_RE  = re.compile(r"\bmake(?:s|d)?\b", re.IGNORECASE)
+_MISS_RE  = re.compile(r"\bmiss(?:es|ed)?\b", re.IGNORECASE)
+_ASSIST_BY_RE   = re.compile(rf"(?<!screen )\bassist(?:ed)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
+_ASSIST_WITH_RE = re.compile(rf"({_FULLNAME})\s+(?:with|get[s]?s?\s+the)\s+assist\b", re.IGNORECASE)
+
+def _clean_frag(s: str) -> str:
+    s = re.sub(r"[^\w.\-'\s,()#]", " ", s or "")
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+def _trim_trailing_verb(name: str) -> str:
+    if not name: return ""
+    tails = {"makes","made","misses","missed","passes","pass","drives","drive","with","gets","get","screens","screen"}
+    parts = name.split()
+    while len(parts) >= 2 and parts[-1].lower() in tails:
+        parts = parts[:-1]
+    return " ".join(parts)
+
+def _strip_leading_preps(s: str) -> str:
+    return re.sub(r"^(?:from|by|to|off|of|the|and)\s+", "", (s or "").strip(), flags=re.IGNORECASE)
+
+def _is_shot_line(line: str) -> bool:
+    return bool(_MAKE_RE.search(line) or _MISS_RE.search(line))
+
+def _nth_shot_line(pbp_text: str, n_index: int) -> str:
+    lines = [ln.strip() for ln in (pbp_text or "").splitlines() if ln.strip()]
+    shot_lines = [ln for ln in lines if _is_shot_line(ln)]
+    if 1 <= int(n_index or 0) <= len(shot_lines):
+        return shot_lines[int(n_index)-1]
+    if len(shot_lines) == 1:
+        return shot_lines[0]
+    return pbp_text or ""
+
+def _norm(nm: str) -> str:
+    return _normalize_to_roster(_strip_leading_preps(_trim_trailing_verb((nm or "").strip())))
+
+def _first_guard_pair(line: str):
+    m = _SHOOT_GUARD_RE.search(_clean_frag(line))
+    if not m:
+        return ("","")
+    a = _norm(m.group(1)); b = _norm(m.group(2))
+    return a, b
+
+def _parse_assister(text: str, prefer_line: str = "") -> str:
+    for src in (prefer_line, text):
+        t = _clean_frag(src)
+        if not t: continue
+        m = _ASSIST_BY_RE.search(t)
+        if m: return _norm(m.group(1))
+        m = _ASSIST_WITH_RE.search(t)
+        if m: return _norm(m.group(1))
+    return ""
+
+def _guess_shooter_from_make_miss(line: str) -> str:
+    if not line: return ""
+    m = _MAKE_RE.search(line) or _MISS_RE.search(line)
+    if not m: return ""
+    prefix = line[:m.start()]
+    names = re.findall(_FULLNAME, prefix)
+    return _norm(names[-1]) if names else ""
+
+def extract_roles_for_shot(pbp_text: str, shot_index: int):
+    """Return (shooter, onball_def, assister, screen_assists[list], candidate_lines[list])."""
+    line = _nth_shot_line(pbp_text or "", shot_index)
+    shooter, onball_def = _first_guard_pair(line)
+    if not shooter:
+        shooter = _guess_shooter_from_make_miss(line)
+
+    assister = _parse_assister(pbp_text or "", prefer_line=line)
+
+    # Screen assists list (basic version—extend if needed)
+    screen_assists = []
+    for mm in re.finditer(r"\bscreen\s+assist\s+by\s+([A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]+)?)", _clean_frag(pbp_text or ""), flags=re.IGNORECASE):
+        nm = _norm(mm.group(1))
+        if nm and nm.lower() not in [s.lower() for s in screen_assists]:
+            screen_assists.append(nm)
+
+    candidates = []
+    for ln in (pbp_text or "").splitlines():
+        lcl = ln.lower()
+        if any(k in lcl for k in ["pick and roll","pick and pop","handoff","drive","post up","switch","help","rescreen"]):
+            candidates.append(ln.strip())
+
+    return shooter, onball_def, assister, screen_assists, candidates
+
+# Optional: blockers from PBP
+_BLOCKS_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+block(?:s|ed|ing)?\s+(?:the\s+)?shot\b", re.IGNORECASE)
+_BLOCKS_BY_RE   = re.compile(rf"\b(?:shot\s+)?block(?:s|ed|ing)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
+def parse_blockers_from_pbp(pbp_text: str, prefer_line: str = "") -> list[str]:
+    names, seen = [], set()
+    for src in (prefer_line, pbp_text or ""):
+        t = _clean_frag(src)
+        if not t: continue
+        for m in re.finditer(_BLOCKS_SUBJ_RE, t):
+            nm = _norm(m.group(1)); key = nm.lower()
+            if nm and key not in seen: names.append(nm); seen.add(key)
+        for m in re.finditer(_BLOCKS_BY_RE, t):
+            nm = _norm(m.group(1)); key = nm.lower()
+            if nm and key not in seen: names.append(nm); seen.add(key)
+    return names
+
+# ---------- attach parsed shooter/defender/assister to each row ----------
+def attach_parsed_roles(row: dict) -> dict:
+    """Enrich a possession row with parsed fields for downstream UI."""
+    if not isinstance(row, dict):
+        return row
+    pbp_text = (row.get("play_by_play_names")
+                or row.get("play_by_play")
+                or row.get("possession")
+                or "").strip()
+    idx = row.get("shot_index") or 1
+
+    shooter, onball_def, assister, screen_ast_list, _ = extract_roles_for_shot(pbp_text, idx)
+
+    shot_line = _nth_shot_line(pbp_text, idx)
+    blockers = parse_blockers_from_pbp(pbp_text, shot_line)
+
+    row["shooter"] = shooter
+    row["onball_defender"] = onball_def
+    row["assister"] = assister
+    row["screen_assists"] = screen_ast_list
+    row["blockers"] = blockers
+
+    # aliases
+    row["parsed_shooter"] = shooter
+    row["parsed_onball_defender"] = onball_def
+    row["parsed_assister"] = assister
+    row["parsed_screen_assists"] = screen_ast_list
+    row["parsed_blockers"] = blockers
+    return row
+
+def get_enriched_possession_rows() -> list[dict]:
+    """Convenience accessor: raw rows + parsed fields; returns a NEW list."""
+    return [attach_parsed_roles(r.copy()) for r in get_possession_rows_cached()]
+
+# ---- Back-compat alias if later sections want enriched rows explicitly ----
+def safe_load_data_enriched() -> list[dict]:
+    return get_enriched_possession_rows()
+
 # ---------------- DEBUG: inspect parser on the first possession ----------------
 @server.route("/debug/first-possession")
 def _debug_first_possession():
     try:
-        rows = load_possessions_cached(DATA_PATH, use_cache=True)
+        rows = get_enriched_possession_rows()
         first = rows[0] if rows else {}
-        pbp_names = (first.get("play_by_play_names") or "").strip()
-        pbp_raw   = (first.get("play_by_play") or "").strip()
-        poss      = (first.get("possession") or "").strip()
-        idx       = first.get("shot_index") or 1
-
-        # Choose best available source text for parsing (THIS is the key fix)
-        pbp_src = pbp_names or pbp_raw or poss or (first.get("shorthand") or "")
-
-        shooter = onball_def = assister = ""
-        screen_asts = []
-        candidates = []
-
-        try:
-            parsed_tuple = extract_roles_for_shot(pbp_src, idx)  # defined below
-            # Expected: (shooter, onball_def, assister, screen_ast_list, candidates)
-            if isinstance(parsed_tuple, (list, tuple)) and len(parsed_tuple) >= 5:
-                shooter, onball_def, assister, screen_asts, candidates = parsed_tuple[:5]
-            else:
-                candidates = [f"Unexpected parse return: {type(parsed_tuple)}"]
-        except Exception as e:
-            candidates = [f"extract_roles_for_shot error: {e}"]
-
         payload = {
-            "pbp_names": pbp_names,
-            "pbp_raw": pbp_raw,
-            "possession": poss,
-            "shot_index": idx,
+            "pbp_names": (first.get("play_by_play_names") or "").strip(),
+            "pbp_raw":   (first.get("play_by_play") or "").strip(),
+            "possession": (first.get("possession") or "").strip(),
+            "shot_index": first.get("shot_index") or 1,
             "parsed": {
-                "shooter": shooter,
-                "onball_defender": onball_def,
-                "assister": assister,
-                "screen_assists": screen_asts,
-                "candidates": candidates,
+                "shooter": first.get("shooter",""),
+                "onball_defender": first.get("onball_defender",""),
+                "assister": first.get("assister",""),
+                "screen_assists": first.get("screen_assists",[]),
+                "blockers": first.get("blockers",[]),
             },
         }
         return Response(json.dumps(payload, indent=2), mimetype="application/json")
@@ -305,7 +506,7 @@ def _safe_serve_layout():
                 html.H1("CWB Practice Stats"),
                 html.Div("The main layout failed to load. Check server logs for details."),
                 html.Pre(STATUS_TEXT),
-                html.Pre(traceback.format_exc() ),
+                html.Pre(traceback.format_exc()),
             ],
             style={"padding": "2rem", "fontFamily": "system-ui, Arial, sans-serif"},
         )
