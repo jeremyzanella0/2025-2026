@@ -4278,6 +4278,14 @@ def serve_layout():
             dcc.Store(id="filters_shoot_state"),
             dcc.Store(id="filters_stats_state"),
             dcc.Store(id="options_cache", data={}),
+
+            # NEW: precomputed rows for first paint
+            dcc.Store(id="store_rows_full"),
+            dcc.Store(id="store_rows_stats"),
+
+            # NEW: fire once on first page load to populate stores
+            dcc.Interval(id="boot_once", interval=1, n_intervals=0, max_intervals=1),
+
         ]
     )
 
@@ -5362,6 +5370,32 @@ def _clear_sel_store(_n):
 
 
 #------------------------------------Section 8---------------------------------------
+
+
+# --- Boot once: compute rows on first page load and cache them in Stores
+from dash import Output, Input  # (safe to re-import if already imported)
+# If you use ALL/MATCH elsewhere, you may also have: from dash.dependencies import ALL, MATCH
+
+@app.callback(
+    Output("store_rows_full", "data"),
+    Output("store_rows_stats", "data"),
+    Input("boot_once", "n_intervals"),
+    prevent_initial_call=False,   # fire on initial page load
+)
+def _init_boot(_):
+    try:
+        rf = _rows_full() or []
+        rs = _rows_stats_all() or []
+        print(f"[BOOT] rows_full={len(rf)} rows_stats={len(rs)} src={_g('DATA_PATH', DATA_PATH)}")
+        return rf, rs
+    except Exception as e:
+        print(f"[BOOT][ERROR] {e}")
+        return [], []
+
+
+
+
+
 
 # ===== details panel =====
 @app.callback(
