@@ -7,7 +7,7 @@ import dash
 from dash import Dash, html, dcc, Output, Input, State, no_update, callback_context, ALL
 import plotly.graph_objects as go
 from flask import Response
-import requests  # allow HTTP(S) data sources
+import requests  # allow URL data sources
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +21,11 @@ def _is_url(s: str) -> bool:
     return isinstance(s, str) and s.lower().startswith(("http://", "https://"))
 
 def _abs_from_app(path_like: str) -> str:
+    """
+    If path_like is a URL, return as-is.
+    If it's empty/None, return empty string.
+    Otherwise make it absolute relative to this file.
+    """
     if not path_like:
         return ""
     if _is_url(path_like):
@@ -28,6 +33,10 @@ def _abs_from_app(path_like: str) -> str:
     return path_like if os.path.isabs(path_like) else os.path.normpath(os.path.join(APP_DIR, path_like))
 
 def _resolve_data_src(env_key: str, default_rel: str) -> str:
+    """
+    Resolve a source from env var or fallback to a repo-relative file path.
+    Handles URLs correctly.
+    """
     return _abs_from_app(os.environ.get(env_key, default_rel))
 
 # Allow overriding all three via env vars
@@ -36,8 +45,12 @@ ROSTER_PATH     = _resolve_data_src("BBALL_ROSTER",     "data/roster.json")
 PRACTICES_PATH  = _resolve_data_src("BBALL_PRACTICES",  "data/practices.json")
 
 # --- DATA LOADER UTILITIES ----------------------------------------------------
+
 def _load_json_any(src):
-    """Load JSON from local file or HTTP(S) URL. Returns list or dict."""
+    """
+    Load JSON from a local file path or HTTP(S) URL.
+    Returns the parsed JSON (list or dict). Raises on errors.
+    """
     if _is_url(src):
         r = requests.get(src, timeout=10)
         r.raise_for_status()
@@ -45,60 +58,6 @@ def _load_json_any(src):
     with open(src, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def _rows_from_json_payload(payload) -> list[dict]:
-    """Normalize common shapes to list[dict]."""
-    if isinstance(payload, list):
-        return [r for r in payload if isinstance(r, dict)]
-    if isinstance(payload, dict):
-        for key in ("rows", "data", "possessions", "items"):
-            if key in payload and isinstance(payload[key], list):
-                return [r for r in payload[key] if isinstance(r, dict)]
-    return []
-
-# Single public accessor used by the rest of the app.
-# It caches by file mtime (local files). For URLs, it just returns latest fetch.
-_CACHED_ROWS: list[dict] = []
-_DATA_LAST_MTIME: float = 0.0
-
-def get_possession_rows_cached(src: str = DATA_PATH) -> list[dict]:
-    """Return raw possession rows with simple caching; always a NEW list (copy)."""
-    global _CACHED_ROWS, _DATA_LAST_MTIME
-    if _is_url(src):
-        try:
-            payload = _load_json_any(src)
-            _CACHED_ROWS = _rows_from_json_payload(payload)
-            return list(_CACHED_ROWS)
-        except Exception as e:
-            print(f"[get_possession_rows_cached:url] {e}")
-            return list(_CACHED_ROWS)
-
-    # local file path
-    if not os.path.exists(src):
-        return list(_CACHED_ROWS)
-    try:
-        mtime = os.path.getmtime(src)
-    except Exception:
-        return list(_CACHED_ROWS)
-
-    if mtime == _DATA_LAST_MTIME and _CACHED_ROWS:
-        return list(_CACHED_ROWS)
-
-    try:
-        payload = _load_json_any(src)
-        rows = _rows_from_json_payload(payload)
-        _CACHED_ROWS = rows
-        _DATA_LAST_MTIME = mtime
-        return list(rows)
-    except Exception as e:
-        print(f"[get_possession_rows_cached:file] {e}")
-        return list(_CACHED_ROWS)
-
-# ---- Back-compat alias so older code keeps working ---------------------------
-def safe_load_data() -> list[dict]:
-    """Compatibility alias: return raw possession rows (cached)."""
-    return get_possession_rows_cached()
-
-# --- DIAGNOSTICS: prove what prod is actually reading -------------------------
 def _count_json(src) -> int:
     try:
         j = _load_json_any(src)
@@ -114,9 +73,6 @@ def _first_row_keys(src):
         j = _load_json_any(src)
         if isinstance(j, list) and j and isinstance(j[0], dict):
             return set(j[0].keys())
-        if isinstance(j, dict):
-            rows = _rows_from_json_payload(j)
-            return set(rows[0].keys()) if rows else set()
     except Exception as e:
         print(f"[first_row_keys] {src}: {e}")
     return set()
@@ -124,21 +80,78 @@ def _first_row_keys(src):
 def _schema_keys(src, k=10):
     try:
         j = _load_json_any(src)
-        rows = _rows_from_json_payload(j) if isinstance(j, dict) else (j if isinstance(j, list) else [])
-        if rows and isinstance(rows[0], dict):
-            return list(rows[0].keys())[:k]
+        if isinstance(j, list) and j and isinstance(j[0], dict):
+            return list(j[0].keys())[:k]
     except Exception as e:
         print(f"[schema_keys] {src}: {e}")
     return []
 
+# -------- Single, canonical possessions loader (replaces duplicate safe_load_data) -----
+_CACHED_ROWS = []
+_DATA_LAST_MTIME = None  # local files only
+
+def load_possessions_cached(src=DATA_PATH, use_cache=True):
+    """
+    Load possessions as a list[dict].
+    - Local file: cache by mtime.
+    - URL: no mtime; light cache if use_cache=True (keeps last good).
+    Returns [] on failure.
+    """
+    global _CACHED_ROWS, _DATA_LAST_MTIME
+
+    # URL source: just try to fetch; if it fails, fall back to cache.
+    if _is_url(src):
+        if not use_cache:
+            try:
+                j = _load_json_any(src)
+                rows = j.get("rows", j) if isinstance(j, dict) else j
+                rows = [r for r in (rows or []) if isinstance(r, dict)]
+                _CACHED_ROWS = rows
+                return list(rows)
+            except Exception as e:
+                print(f"[load_possessions_cached][URL fresh] {e}")
+                return list(_CACHED_ROWS)
+        # cached path
+        try:
+            j = _load_json_any(src)
+            rows = j.get("rows", j) if isinstance(j, dict) else j
+            rows = [r for r in (rows or []) if isinstance(r, dict)]
+            _CACHED_ROWS = rows
+            return list(rows)
+        except Exception as e:
+            print(f"[load_possessions_cached][URL cached] {e}")
+            return list(_CACHED_ROWS)
+
+    # Local file path
+    if not os.path.exists(src):
+        return list(_CACHED_ROWS)
+    try:
+        mtime = os.path.getmtime(src)
+    except Exception:
+        return list(_CACHED_ROWS)
+
+    if use_cache and _DATA_LAST_MTIME == mtime and _CACHED_ROWS:
+        return list(_CACHED_ROWS)
+
+    try:
+        j = _load_json_any(src)
+        rows = j.get("rows", j) if isinstance(j, dict) else j
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+        _CACHED_ROWS = rows
+        _DATA_LAST_MTIME = mtime
+        return list(rows)
+    except Exception as e:
+        print(f"[load_possessions_cached][local] {e}")
+        return list(_CACHED_ROWS)
+
 def _peek_json(src, limit=2):
     try:
-        rows = get_possession_rows_cached(src)
+        data = load_possessions_cached(src, use_cache=False)
     except Exception as e:
         print(f"[PEEK] failed to load {src}: {e}")
         return
     keys_union = set()
-    for r in rows[:limit]:
+    for r in data[:limit]:
         if isinstance(r, dict):
             keys_union.update(r.keys())
     print("=== DATA DIAGNOSTIC ===")
@@ -152,7 +165,7 @@ def _peek_json(src, limit=2):
             print(f"[URL] HEAD failed: {e}")
     else:
         print(f"[EXISTS] {os.path.exists(src)} size={os.path.getsize(src) if os.path.exists(src) else 0}")
-    print(f"[COUNT] {len(rows)}")
+    print(f"[COUNT] {len(data)}")
     print(f"[SAMPLE KEYS] {sorted(list(keys_union))}")
     print("=======================")
 
@@ -160,7 +173,7 @@ def _parse_probe(src):
     """Print the raw fields the parser relies on for the first possession."""
     print("=== PARSE PROBE (first possession) ===")
     try:
-        rows = get_possession_rows_cached(src)
+        rows = load_possessions_cached(src, use_cache=False)
         if not rows:
             print("[PARSE PROBE] No possessions loaded or wrong format.")
         else:
@@ -173,6 +186,18 @@ def _parse_probe(src):
     except Exception as e:
         print("[PARSE PROBE ERROR]", e)
     print("======================================")
+
+
+# --- Back-compat loader alias (so older code calling safe_load_data keeps working) ---
+def safe_load_data(path_like: str | None = None):
+    """
+    Back-compat wrapper around load_possessions_cached.
+    Returns a list[dict] of possession rows.
+    Accepts optional path; defaults to DATA_PATH.
+    """
+    src = path_like if path_like else DATA_PATH
+    return load_possessions_cached(src, use_cache=True)
+
 
 # --- DIAGNOSTICS @ IMPORT -----------------------------------------------------
 print("=== Startup data check ===")
@@ -217,271 +242,45 @@ server = app.server
 def _healthz():
     return Response("ok", mimetype="text/plain")
 
-# =========================
-# Court geometry (must match entry app exactly)
-# =========================
-COURT_W = 50.0
-HALF_H = 47.0
-RIM_X, RIM_Y, RIM_R = 25.0, 4.25, 0.75
-BACKBOARD_Y, RESTRICTED_R = 3.0, 4.0
-LANE_W, FT_CY, FT_R = 16.0, 19.0, 6.0
-LANE_X0, LANE_X1 = RIM_X - LANE_W/2.0, RIM_X + LANE_W/2.0
-THREE_R, SIDELINE_INSET = 22.15, 3.0
-LEFT_POST_X, RIGHT_POST_X = SIDELINE_INSET, COURT_W - SIDELINE_INSET
-
-# =========================
-# Roster helpers (normalize names)
-# =========================
-def _load_roster_from_disk():
-    try:
-        if os.path.exists(ROSTER_PATH):
-            with open(ROSTER_PATH, "r", encoding="utf-8") as f:
-                raw = json.load(f) or {}
-            out = {}
-            for k, v in raw.items():
-                try:
-                    kk = str(int(k))
-                    name = (v or "").strip()
-                    if name:
-                        out[kk] = name
-                except:
-                    continue
-            return out
-    except Exception as e:
-        print(f"[roster load] {e}")
-    return {}
-
-def _last_name(full: str) -> str:
-    parts = [p for p in re.split(r"\s+", (full or "").strip()) if p]
-    return parts[-1] if parts else (full or "")
-
-def _first_name(full: str) -> str:
-    parts = [p for p in re.split(r"\s+", (full or "").strip()) if p]
-    return parts[0] if parts else (full or "")
-
-def _build_name_maps(roster_dict: dict):
-    last_map, first_map, full_set = {}, {}, set()
-    for full in roster_dict.values():
-        ln = _last_name(full); fn = _first_name(full)
-        last_map.setdefault(ln.lower(), []).append(full)
-        first_map.setdefault(fn.lower(), []).append(full)
-        full_set.add(full.strip().lower())
-    return last_map, first_map, full_set
-
-_ROSTER_CACHE = None
-def _get_roster_cache():
-    global _ROSTER_CACHE
-    if _ROSTER_CACHE is None:
-        _ROSTER_CACHE = _load_roster_from_disk() or {}
-    return _ROSTER_CACHE
-
-def _normalize_to_roster(nm: str, roster_dict: dict | None = None) -> str:
-    nm = (nm or "").strip()
-    if not nm:
-        return nm
-    roster_dict = roster_dict or _get_roster_cache()
-    last_map, first_map, full_set = _build_name_maps(roster_dict)
-    low = nm.lower()
-
-    if " " in nm and low in full_set:
-        for full in roster_dict.values():
-            if full.strip().lower() == low:
-                return full
-
-    if " " not in nm:
-        if low in last_map and len(last_map[low]) == 1:
-            return last_map[low][0]
-        if low in first_map and len(first_map[low]) == 1:
-            return first_map[low][0]
-        subs = [full for full in roster_dict.values() if low in full.lower()]
-        if len(subs) == 1:
-            return subs[0]
-        return nm
-
-    parts = nm.split()
-    first_tok, last_tok = parts[0].lower(), parts[-1].lower()
-    cands = []
-    for full in roster_dict.values():
-        fparts = full.lower().split()
-        if fparts and fparts[0].startswith(first_tok) and fparts[-1] == last_tok:
-            cands.append(full)
-    if len(cands) == 1:
-        return cands[0]
-    return nm
-
-def _normalize_list(names):
-    roster = _get_roster_cache()
-    out, seen = [], set()
-    for n in (names or []):
-        nn = _normalize_to_roster(n, roster)
-        key = (nn or "").strip().lower()
-        if nn and key not in seen:
-            out.append(nn); seen.add(key)
-    return out
-
-# =========================
-# Parsing helpers (shooter / defender / assister)
-# =========================
-_CAP = r"[A-Z][a-zA-Z0-9.\-']+"
-_FULLNAME = rf"{_CAP}(?:\s+{_CAP})?"
-
-_SHOOT_GUARD_RE = re.compile(rf"({_FULLNAME})\s*guarded\s*by\s*({_FULLNAME})", re.IGNORECASE)
-_MAKE_RE  = re.compile(r"\bmake(?:s|d)?\b", re.IGNORECASE)
-_MISS_RE  = re.compile(r"\bmiss(?:es|ed)?\b", re.IGNORECASE)
-_ASSIST_BY_RE   = re.compile(rf"(?<!screen )\bassist(?:ed)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
-_ASSIST_WITH_RE = re.compile(rf"({_FULLNAME})\s+(?:with|get[s]?s?\s+the)\s+assist\b", re.IGNORECASE)
-
-def _clean_frag(s: str) -> str:
-    s = re.sub(r"[^\w.\-'\s,()#]", " ", s or "")
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
-
-def _trim_trailing_verb(name: str) -> str:
-    if not name: return ""
-    tails = {"makes","made","misses","missed","passes","pass","drives","drive","with","gets","get","screens","screen"}
-    parts = name.split()
-    while len(parts) >= 2 and parts[-1].lower() in tails:
-        parts = parts[:-1]
-    return " ".join(parts)
-
-def _strip_leading_preps(s: str) -> str:
-    return re.sub(r"^(?:from|by|to|off|of|the|and)\s+", "", (s or "").strip(), flags=re.IGNORECASE)
-
-def _is_shot_line(line: str) -> bool:
-    return bool(_MAKE_RE.search(line) or _MISS_RE.search(line))
-
-def _nth_shot_line(pbp_text: str, n_index: int) -> str:
-    lines = [ln.strip() for ln in (pbp_text or "").splitlines() if ln.strip()]
-    shot_lines = [ln for ln in lines if _is_shot_line(ln)]
-    if 1 <= int(n_index or 0) <= len(shot_lines):
-        return shot_lines[int(n_index)-1]
-    if len(shot_lines) == 1:
-        return shot_lines[0]
-    return pbp_text or ""
-
-def _norm(nm: str) -> str:
-    return _normalize_to_roster(_strip_leading_preps(_trim_trailing_verb((nm or "").strip())))
-
-def _first_guard_pair(line: str):
-    m = _SHOOT_GUARD_RE.search(_clean_frag(line))
-    if not m:
-        return ("","")
-    a = _norm(m.group(1)); b = _norm(m.group(2))
-    return a, b
-
-def _parse_assister(text: str, prefer_line: str = "") -> str:
-    for src in (prefer_line, text):
-        t = _clean_frag(src)
-        if not t: continue
-        m = _ASSIST_BY_RE.search(t)
-        if m: return _norm(m.group(1))
-        m = _ASSIST_WITH_RE.search(t)
-        if m: return _norm(m.group(1))
-    return ""
-
-def _guess_shooter_from_make_miss(line: str) -> str:
-    if not line: return ""
-    m = _MAKE_RE.search(line) or _MISS_RE.search(line)
-    if not m: return ""
-    prefix = line[:m.start()]
-    names = re.findall(_FULLNAME, prefix)
-    return _norm(names[-1]) if names else ""
-
-def extract_roles_for_shot(pbp_text: str, shot_index: int):
-    """Return (shooter, onball_def, assister, screen_assists[list], candidate_lines[list])."""
-    line = _nth_shot_line(pbp_text or "", shot_index)
-    shooter, onball_def = _first_guard_pair(line)
-    if not shooter:
-        shooter = _guess_shooter_from_make_miss(line)
-
-    assister = _parse_assister(pbp_text or "", prefer_line=line)
-
-    # Screen assists list (basic version—extend if needed)
-    screen_assists = []
-    for mm in re.finditer(r"\bscreen\s+assist\s+by\s+([A-Z][\w.'-]+(?:\s+[A-Z][\w.'-]+)?)", _clean_frag(pbp_text or ""), flags=re.IGNORECASE):
-        nm = _norm(mm.group(1))
-        if nm and nm.lower() not in [s.lower() for s in screen_assists]:
-            screen_assists.append(nm)
-
-    candidates = []
-    for ln in (pbp_text or "").splitlines():
-        lcl = ln.lower()
-        if any(k in lcl for k in ["pick and roll","pick and pop","handoff","drive","post up","switch","help","rescreen"]):
-            candidates.append(ln.strip())
-
-    return shooter, onball_def, assister, screen_assists, candidates
-
-# Optional: blockers from PBP
-_BLOCKS_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+block(?:s|ed|ing)?\s+(?:the\s+)?shot\b", re.IGNORECASE)
-_BLOCKS_BY_RE   = re.compile(rf"\b(?:shot\s+)?block(?:s|ed|ing)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
-def parse_blockers_from_pbp(pbp_text: str, prefer_line: str = "") -> list[str]:
-    names, seen = [], set()
-    for src in (prefer_line, pbp_text or ""):
-        t = _clean_frag(src)
-        if not t: continue
-        for m in re.finditer(_BLOCKS_SUBJ_RE, t):
-            nm = _norm(m.group(1)); key = nm.lower()
-            if nm and key not in seen: names.append(nm); seen.add(key)
-        for m in re.finditer(_BLOCKS_BY_RE, t):
-            nm = _norm(m.group(1)); key = nm.lower()
-            if nm and key not in seen: names.append(nm); seen.add(key)
-    return names
-
-# ---------- attach parsed shooter/defender/assister to each row ----------
-def attach_parsed_roles(row: dict) -> dict:
-    """Enrich a possession row with parsed fields for downstream UI."""
-    if not isinstance(row, dict):
-        return row
-    pbp_text = (row.get("play_by_play_names")
-                or row.get("play_by_play")
-                or row.get("possession")
-                or "").strip()
-    idx = row.get("shot_index") or 1
-
-    shooter, onball_def, assister, screen_ast_list, _ = extract_roles_for_shot(pbp_text, idx)
-
-    shot_line = _nth_shot_line(pbp_text, idx)
-    blockers = parse_blockers_from_pbp(pbp_text, shot_line)
-
-    row["shooter"] = shooter
-    row["onball_defender"] = onball_def
-    row["assister"] = assister
-    row["screen_assists"] = screen_ast_list
-    row["blockers"] = blockers
-
-    # aliases
-    row["parsed_shooter"] = shooter
-    row["parsed_onball_defender"] = onball_def
-    row["parsed_assister"] = assister
-    row["parsed_screen_assists"] = screen_ast_list
-    row["parsed_blockers"] = blockers
-    return row
-
-def get_enriched_possession_rows() -> list[dict]:
-    """Convenience accessor: raw rows + parsed fields; returns a NEW list."""
-    return [attach_parsed_roles(r.copy()) for r in get_possession_rows_cached()]
-
-# ---- Back-compat alias if later sections want enriched rows explicitly ----
-def safe_load_data_enriched() -> list[dict]:
-    return get_enriched_possession_rows()
-
 # ---------------- DEBUG: inspect parser on the first possession ----------------
 @server.route("/debug/first-possession")
 def _debug_first_possession():
     try:
-        rows = get_enriched_possession_rows()
+        rows = load_possessions_cached(DATA_PATH, use_cache=True)
         first = rows[0] if rows else {}
+        pbp_names = (first.get("play_by_play_names") or "").strip()
+        pbp_raw   = (first.get("play_by_play") or "").strip()
+        poss      = (first.get("possession") or "").strip()
+        idx       = first.get("shot_index") or 1
+
+        # Choose best available source text for parsing (THIS is the key fix)
+        pbp_src = pbp_names or pbp_raw or poss or (first.get("shorthand") or "")
+
+        shooter = onball_def = assister = ""
+        screen_asts = []
+        candidates = []
+
+        try:
+            parsed_tuple = extract_roles_for_shot(pbp_src, idx)  # defined below
+            # Expected: (shooter, onball_def, assister, screen_ast_list, candidates)
+            if isinstance(parsed_tuple, (list, tuple)) and len(parsed_tuple) >= 5:
+                shooter, onball_def, assister, screen_asts, candidates = parsed_tuple[:5]
+            else:
+                candidates = [f"Unexpected parse return: {type(parsed_tuple)}"]
+        except Exception as e:
+            candidates = [f"extract_roles_for_shot error: {e}"]
+
         payload = {
-            "pbp_names": (first.get("play_by_play_names") or "").strip(),
-            "pbp_raw":   (first.get("play_by_play") or "").strip(),
-            "possession": (first.get("possession") or "").strip(),
-            "shot_index": first.get("shot_index") or 1,
+            "pbp_names": pbp_names,
+            "pbp_raw": pbp_raw,
+            "possession": poss,
+            "shot_index": idx,
             "parsed": {
-                "shooter": first.get("shooter",""),
-                "onball_defender": first.get("onball_defender",""),
-                "assister": first.get("assister",""),
-                "screen_assists": first.get("screen_assists",[]),
-                "blockers": first.get("blockers",[]),
+                "shooter": shooter,
+                "onball_defender": onball_def,
+                "assister": assister,
+                "screen_assists": screen_asts,
+                "candidates": candidates,
             },
         }
         return Response(json.dumps(payload, indent=2), mimetype="application/json")
@@ -506,7 +305,7 @@ def _safe_serve_layout():
                 html.H1("CWB Practice Stats"),
                 html.Div("The main layout failed to load. Check server logs for details."),
                 html.Pre(STATUS_TEXT),
-                html.Pre(traceback.format_exc()),
+                html.Pre(traceback.format_exc() ),
             ],
             style={"padding": "2rem", "fontFamily": "system-ui, Arial, sans-serif"},
         )
@@ -1254,6 +1053,7 @@ def compute_ratings_for_row(row: dict) -> dict:
 
 #--------------------------------------------Section 2-------------------------------------------------------
 
+
 # ------------------------- OFF-BALL actions + coverages -------------------------
 _OFFBALL_TYPES = {
     "bd":  {"label": "Backdoor cut", "keys": [r"\bbackdoor\b", r"backdoor\s+cut"]},
@@ -1300,7 +1100,7 @@ def parse_offball_actions_from_pbp(lines):
         pairs = _parse_guarded_pairs_in_order(ln)
         coming_off, coming_off_def = ("","")
         screeners = []
-        is_shot_ln = _is_shot_line(ln)  # tie off-ball action to shot line
+        is_shot_ln = _is_shot_line(ln)  # <-- NEW: tie off-ball action to shot line
 
         if pairs:
             coming_off, coming_off_def = pairs[0]
@@ -1314,8 +1114,8 @@ def parse_offball_actions_from_pbp(lines):
             "coming_off_def": coming_off_def,
             "screeners": screeners,
             "coverages": _parse_coverages(ln),
-            "connected_to_shot": bool(is_shot_ln),
-            "shot_connected": bool(is_shot_ln)
+            "connected_to_shot": bool(is_shot_ln),  # NEW
+            "shot_connected": bool(is_shot_ln)      # NEW (alias)
         }
         actions.append(d)
 
@@ -1323,10 +1123,21 @@ def parse_offball_actions_from_pbp(lines):
 
 
 # ========================== NEW (mk9-adv): Advanced Stats config ==========================
-ADVANCED_STATS_TABLE_ID = "adv-stats-table"
+# This tiny additive block declares metadata for a second "Advanced Stats" table
+# that lives directly under the basic Stats table. Initially, we are *moving*
+# OP and DP from the basic table into this advanced table. Later sections will:
+#   - compute/populate these values (no behavior changes here)
+#   - render a second DataTable using this schema
+#
+# Nothing in existing logic is changed by this; it's just configuration the
+# later sections can import.
 
+ADVANCED_STATS_TABLE_ID = "adv-stats-table"  # component id to use in layout/callbacks
+
+# Column definitions for the Advanced table (now includes eFG%, PPS, AST%, TOV%, AST/TO).
+# UPDATED: appended ORtg, DRtg, NET, and +/- to the table.
 ADVANCED_STATS_COLUMNS = [
-    {"key": "Player", "name": "Player"},
+    {"key": "Player", "name": "Player"},  # keep Player as first column for sorting consistency
     {"key": "eFG%",   "name": "eFG%"},
     {"key": "PPS",    "name": "PPS"},
     {"key": "AST%",   "name": "AST%"},
@@ -1334,20 +1145,25 @@ ADVANCED_STATS_COLUMNS = [
     {"key": "AST/TO", "name": "AST/TO"},
     {"key": "OP",     "name": "OP"},
     {"key": "DP",     "name": "DP"},
+    # ---- NEW (mk12-rtg): rating/impact fields to display in Advanced table
     {"key": "ORtg",   "name": "ORtg"},
     {"key": "DRtg",   "name": "DRtg"},
     {"key": "NET",    "name": "NET"},
     {"key": "+/-",    "name": "+/-"},
 ]
 
+# Convenience: list of stat keys (excluding 'Player') used by later sections
 ADVANCED_STATS_KEYS = ["eFG%", "PPS", "AST%", "TOV%", "AST/TO", "OP", "DP", "ORtg", "DRtg", "NET", "+/-"]
 
+# Helper that a later section can call to project a full player record dict
+# into the Advanced-table record shape, without mutating the source.
 def build_advanced_row(player_record: dict) -> dict:
     rec = dict(Player=player_record.get("Player", ""))
     for k in ADVANCED_STATS_KEYS:
         rec[k] = player_record.get(k, 0)
     return rec
 
+# ---- NEW (adv helpers): safe calculators for the advanced stats -----------------
 def _safe_div(n, d, default=0.0):
     try:
         d = float(d)
@@ -1356,20 +1172,37 @@ def _safe_div(n, d, default=0.0):
         return default
 
 def calc_efg_percent(fgm, tpm, fga):
+    """
+    eFG% = (FGM + 0.5 * 3PM) / FGA * 100
+    Returns a percentage (float). Caller can round/format in UI.
+    """
     return 100.0 * _safe_div((float(fgm) + 0.5 * float(tpm)), fga, 0.0)
 
 def calc_pps(pts, fga):
+    """
+    PPS = PTS / FGA
+    """
     return _safe_div(pts, fga, 0.0)
 
 def calc_ast_percent(ast, op):
+    """
+    AST% = 100 * (AST / OP)
+    """
     return 100.0 * _safe_div(ast, op, 0.0)
 
 def calc_tov_percent(to, op):
+    """
+    TOV% = 100 * (TO / OP)
+    """
     return 100.0 * _safe_div(to, op, 0.0)
 
 def calc_ast_to_ratio(ast, to):
+    """
+    AST/TO = AST / TO
+    """
     return _safe_div(ast, to, 0.0)
 # ====================== END (mk9-adv): Advanced Stats config ==========================
+
 
 
 # -------------------------
@@ -1416,25 +1249,48 @@ STAT_TOOLTIPS = {
 }
 
 def build_header_tooltips(columns):
+    """
+    Accepts Dash column dicts like {"name": "...", "id": "..."} or {"name": "...", "key": "..."}
+    Returns the mapping Dash DataTable expects for header tooltips.
+    """
     tips = {}
     for c in (columns or []):
         cid = c.get("id") or c.get("key") or c.get("name")
         if not cid:
             continue
+        # Use our long name if we have it, otherwise fall back to the header text
         full = STAT_TOOLTIPS.get(cid, str(c.get("name", cid)))
+        # Dash accepts either a plain string or {"value": "...", "type": "text"/"markdown"}
         tips[cid] = {"value": full, "type": "text"}
     return tips
 
 
+
 # ====================== NEW (mk10-PTS+SA): Basic Stats extensions ======================
+# These additions are *declarative* only in Section 1 so later sections can:
+#  - compute and accumulate PTS (2 for made 2s, 3 for made 3s; 0 otherwise),
+#  - accumulate SA (screen assists) using the existing parsing,
+#  - and place the columns in the desired order in the basic stats table
+#    without modifying unrelated code.
+
+# Keys to add to the Basic Stats model (computed later in aggregation).
 BASIC_STATS_EXTRA_KEYS = ["PTS", "SA"]
 
+# Desired insertion points for new columns in the Basic table.
+# The consumer (later section) can read this to splice columns accordingly.
+# - PTS goes between Player and FGM  => "after": "Player"
+# - SA  goes between AST and DRB     => "after": "AST"
 BASIC_STATS_INSERT_RULES = {
     "PTS": {"after": "Player"},
     "SA":  {"after": "AST"},
 }
 
 def points_from_shot(result: str, value: int) -> int:
+    """
+    Compute points from a single shot attempt.
+    - value should be 2 or 3 (see _row_shot_value elsewhere).
+    - Only MADE shots count toward points.
+    """
     try:
         if (result or "").strip() == "Make":
             return 3 if int(value) == 3 else 2
@@ -1444,19 +1300,28 @@ def points_from_shot(result: str, value: int) -> int:
 # ==================== END (mk10-PTS+SA): Basic Stats extensions ====================
 
 
+
 # =======================  mk5 ADDITIONS START  =========================
-from datetime import datetime  # used by date helpers
+from datetime import datetime  # --- NEW: required by Section 1 date helpers (PRAC support)
 
 # ---- Filter option sets (used by UI + predicates)
 ONBALL_ACTION_CODES = {"h","d","p","pnr","pnp","slp","rj","gst","dho","ho","kp","rs"}
-OFFBALL_ACTION_CODES = {"bd","pn","fl","bk","awy","hm","crs","wdg","rip","ucla","stg","ivs","elv"}
-DEFENSE_FILTERS = {"Man", "Zone"}
+OFFBALL_ACTION_CODES = {"bd","pn","fl","bk","awy", "hm", "crs","wdg","rip","ucla","stg","ivs","elv"}
+DEFENSE_FILTERS = {"Man", "Zone"}  # 'Man' vs 'Zone' (Zone includes 2-3, 3-2, 1-3-1, Matchup, etc.)
 
-# ---- STRICT roster canonicalization ---
+# ---- STRICT roster canonicalization (fixes 'Boyd dribbles', 'for Fontana', etc.) --
+# We constrain all names to the roster's exact Full Name. Anything else is dropped.
+
 _NAME_VERBS = r"(?:dribbles|drives|passes|screens|rebounds?|boards?|steals?|blocks?|fouls?|turnover|travels?|shoots?|cuts?|rolls?|slips?|hands?|handoff|posts?|sets?|receives?|catches?|tips?)"
 _NAME_PREPS = r"(?:for|to|by|on|at|from|with|over|against|vs\.?|into|out of|off)"
 
 def _roster_maps():
+    """
+    Build maps from the current roster cache:
+      - full_map: { 'kaeli boyd' -> 'Kaeli Boyd' }
+      - last_to_fulls: { 'boyd' -> ['Kaeli Boyd', ...] }
+      - last_unique: { 'boyd' -> 'Kaeli Boyd' }  # only when unique
+    """
     roster = _get_roster_cache() or {}
     full_map = {}
     last_to_fulls = {}
@@ -1471,13 +1336,22 @@ def _roster_maps():
     return full_map, last_to_fulls, last_unique
 
 def _strict_canon_name(token: str) -> str:
+    """
+    Convert a free-text fragment into an exact roster Full Name, or '' if not resolvable.
+    Examples:
+      'Boyd dribbles' -> 'Kaeli Boyd'
+      'for Fontana'  -> 'Adriana Fontana'
+      'Kaeli Boyd'   -> 'Kaeli Boyd' (unchanged)
+    """
     if not token:
         return ""
     s = str(token).strip()
+
+    # Normalize common phrasing noise
     s = re.sub(r"\bguarded\s+by\b", "", s, flags=re.IGNORECASE)
-    s = re.sub(rf"^(?:{_NAME_PREPS})\s+", "", s, flags=re.IGNORECASE)
-    s = re.sub(rf"\s+{_NAME_VERBS}\b.*$", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"[,\.;:\-\u2013\u2014]+$", "", s).strip()
+    s = re.sub(rf"^(?:{_NAME_PREPS})\s+", "", s, flags=re.IGNORECASE)        # leading 'for ', 'to ', etc.
+    s = re.sub(rf"\s+{_NAME_VERBS}\b.*$", "", s, flags=re.IGNORECASE)        # trailing ' dribbles', etc.
+    s = re.sub(r"[,\.;:\-\u2013\u2014]+$", "", s).strip()                    # trailing punct
     s = re.sub(r"\s{2,}", " ", s)
 
     if not s:
@@ -1485,13 +1359,17 @@ def _strict_canon_name(token: str) -> str:
 
     full_map, _many, last_unique = _roster_maps()
 
+    # Exact full-name match?
     low = s.lower()
     if low in full_map:
         return full_map[low]
 
-    if " " not in s and s.lower() in last_unique:
-        return last_unique[s.lower()]
+    # Try unique last-name only
+    if " " not in s:
+        if s.lower() in last_unique:
+            return last_unique[s.lower()]
 
+    # Try 'Last, First' -> 'First Last'
     parts = s.split()
     if len(parts) == 2 and parts[0].endswith(","):
         candidate = f"{parts[1]} {parts[0].strip(',')}"
@@ -1501,9 +1379,14 @@ def _strict_canon_name(token: str) -> str:
     return ""
 
 def _canon_list_from_string(name_str: str) -> list[str]:
+    """
+    Split a display string like 'Kaeli Boyd, Adriana Fontana and Ashley Santiago'
+    and return unique, roster-canonical full names in order.
+    """
     s = (name_str or "").strip()
     if not s:
         return []
+    # split on commas and ' and '
     raw = re.split(r"\s*(?:,| and )\s*", s)
     out, seen = [], set()
     for frag in raw:
@@ -1513,6 +1396,7 @@ def _canon_list_from_string(name_str: str) -> list[str]:
     return out
 
 def _canon_join(names: list[str]) -> str:
+    """Join canonical names with ', ' for display fields."""
     return ", ".join([n for n in (names or []) if n])
 
 # ---- Robust, flexible getters from possession rows ---------------------------------
@@ -1526,11 +1410,18 @@ def _coerce_int(x, default=1):
         return default
 
 def _normalize_date_str(s: str) -> str:
+    """
+    Normalize a few common date shapes to ISO-ish 'YYYY-MM-DD' strings if possible.
+    Accepts things like '9/12 practice', '09-12-2025', '2025/09/12', '9/12'.
+    Falls back to original string if we cannot normalize.
+    """
     if not s:
         return ""
     s = str(s)
+    # Already looks ISO
     if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
         return s
+    # Find first mm/dd[/yy]
     m = _DATE_TOKEN_RE.search(s)
     if not m:
         return s.strip()
@@ -1538,12 +1429,19 @@ def _normalize_date_str(s: str) -> str:
     dd = int(m.group("d") or 0)
     yy = m.group("y")
     if yy and len(yy) == 2:
-        yy = ("20" + yy)
+        yy = ("20" + yy)  # naive 20xx assumption for practice logs
     if not yy:
+        # No year provided; leave off (we'll compare with month/day only if needed)
         return f"{mm:02d}-{dd:02d}"
     return f"{yy}-{mm:02d}-{dd:02d}"
 
 def _row_practice_date_key(row: dict) -> str:
+    """
+    Extract a comparable date key for filtering:
+      - Prefer row['practice_date'] or row['date']
+      - Else try row['group_label'] / row['group_id'] text like '9/12 practice'
+      - Returns ISO-like 'YYYY-MM-DD' when possible; otherwise a best-effort token.
+    """
     for k in ("practice_date","date","group_label","group_id","session","label","title"):
         v = row.get(k)
         if v:
@@ -1551,6 +1449,10 @@ def _row_practice_date_key(row: dict) -> str:
     return ""
 
 def _row_drill_label(row: dict) -> str:
+    """
+    Extract the full drill label (e.g., '5v5 Stags', '3v3 Pin Down').
+    Tries fields: drill, drill_label, group_label, label.
+    """
     for k in ("drill","drill_label","group_label","label","title"):
         v = (row.get(k) or "").strip()
         if v:
@@ -1560,6 +1462,10 @@ def _row_drill_label(row: dict) -> str:
 _DRILL_SIZE_RE = re.compile(r"\b(\d+)\s*[vV]\s*(\d+)\b")
 
 def _row_drill_size(row: dict) -> str:
+    """
+    Parse and normalize the 'NvM' size token from the drill label.
+    Returns strings like '5v5', '3v3', or '' if not found.
+    """
     lbl = _row_drill_label(row)
     m = _DRILL_SIZE_RE.search(lbl)
     if not m:
@@ -1567,21 +1473,14 @@ def _row_drill_size(row: dict) -> str:
     return f"{int(m.group(1))}v{int(m.group(2))}"
 
 def _row_possession_text(row: dict) -> str:
-    """Long free-text shorthand/codes field from entry app."""
     return (row.get("possession") or row.get("pbp") or row.get("text") or "").strip()
 
-def _row_pbp_for_parsing(row: dict) -> str:
-    """
-    CRITICAL FIX: always prefer the name-resolved PBP for role parsing.
-    Falls back to raw pbp, then to shorthand long text.
-    """
-    return (
-        (row.get("play_by_play_names") or "").strip()
-        or (row.get("play_by_play") or "").strip()
-        or _row_possession_text(row)
-    )
-
+# NEW: read shorthand codes where no-shot specials are entered
 def _row_shorthand_text(row: dict) -> str:
+    """
+    Return the shorthand codes string for a possession.
+    Tries common keys used by entry apps before falling back to the long text.
+    """
     for k in ("shorthand", "short", "sh", "codes", "pbp_short", "sh_text"):
         v = row.get(k)
         if v:
@@ -1589,9 +1488,14 @@ def _row_shorthand_text(row: dict) -> str:
     return _row_possession_text(row)
 
 def _row_shot_index(row: dict) -> int:
+    """
+    Provide the nth shot in the possession for parsing.
+    Defaults to 1 if unspecified. If the entry app logs a 'shot_index', we'll use it.
+    """
     return _coerce_int(row.get("shot_index"), 1)
 
 def _row_xy(row: dict):
+    """Return (x,y) if present (floatable), else (None,None)."""
     try:
         x = float(row.get("x", None)); y = float(row.get("y", None))
         if 0 <= x <= COURT_W and 0 <= y <= HALF_H:
@@ -1601,50 +1505,61 @@ def _row_xy(row: dict):
     return None, None
 
 def _row_result(row: dict) -> str:
+    """Return 'Make'/'Miss' if present/derivable; else ''."""
     res = row.get("result")
     if res in ("Make","Miss"):
         return res
+    # FIX: derive from shorthand first (where +/++/- lives), else from full text
     rs = result_from_shorthand(_row_shorthand_text(row)) or result_from_shorthand(_row_possession_text(row))
     return rs or ""
 
 def _row_shot_value(x: float, y: float) -> int:
+    """2 or 3 based on distance/line. Simple arc check with side lines."""
     if x is None or y is None:
         return 0
+    # Three if beyond arc and beyond straight lines near corners
     dist = math.hypot(x - RIM_X, y - RIM_Y)
     if dist > THREE_R:
+        # Corner lines from LEFT_POST_X and RIGHT_POST_X up to their y limits
         left_t = math.asin(max(-1,min(1,(LEFT_POST_X - RIM_X)/THREE_R)))
         right_t = math.asin(max(-1,min(1,(RIGHT_POST_X - RIM_X)/THREE_R)))
         y_left  = RIM_Y + THREE_R*math.cos(left_t)
         y_right = RIM_Y + THREE_R*math.cos(right_t)
+        # If outside side line region or above the arc endpoints
         if (x <= LEFT_POST_X and y <= y_left) or (x >= RIGHT_POST_X and y <= y_right):
             return 2
         return 3
     return 2
 
-# ---- Role & action extraction wrappers (using your parsers) ---------------
+# ---- Role & action extraction wrappers (using your existing parsers) ---------------
 
 def _row_roles_and_lines(row: dict):
     """
-    Derive roles for the nth shot from the *best PBP source*:
+    Uses your mk4 helpers to derive roles for the nth shot:
       shooter, defenders_display, assister, screen_assists[list], candidate_lines[list]
-    Names are canonicalized to roster Full Names.
+    Ensures all names are canonicalized to roster Full Names.
     """
-    pbp = _row_pbp_for_parsing(row)
-    idx = _row_shot_index(row)
+    text = _row_possession_text(row)
+    idx  = _row_shot_index(row)
+    shooter, defenders_display, assister, screen_list, cand_lines = extract_roles_for_shot(text, idx)
 
-    shooter, defenders_display, assister, screen_list, cand_lines = extract_roles_for_shot(pbp, idx)
-
-    shooter_c  = _strict_canon_name(shooter)
+    # Canonicalize each field to EXACT roster names
+    shooter_c = _strict_canon_name(shooter)
     assister_c = _strict_canon_name(assister)
-    screen_c   = [_strict_canon_name(n) for n in (screen_list or [])]
-    screen_c   = [n for n in screen_c if n]
+    screen_c = [_strict_canon_name(n) for n in (screen_list or [])]
+    screen_c = [n for n in screen_c if n]
 
+    # defenders_display may be a string like 'A, B' — normalize to join of full names
     def_list = _canon_list_from_string(defenders_display)
     defenders_disp_c = _canon_join(def_list)
 
     return shooter_c, defenders_disp_c, assister_c, screen_c, cand_lines
 
 def _row_onball_offball_actions(row: dict):
+    """
+    Returns (onball_actions[list[dict]], offball_actions[list[dict]]) parsed from
+    candidate lines for this possession/shot.
+    """
     shooter, ondef, ast, screen_list, cand_lines = _row_roles_and_lines(row)
     onball = parse_onball_actions_from_pbp(cand_lines, (screen_list[0] if screen_list else ""))
     offball = parse_offball_actions_from_pbp(cand_lines)
@@ -1652,57 +1567,15 @@ def _row_onball_offball_actions(row: dict):
 
 def _row_defense_label(row: dict) -> str:
     """
-    'Man' or 'Zone' depending on zone_for_shot() (defined later).
+    Return 'Man' or 'Zone' depending on your zone_for_shot() classifier
+    (which is defined later in the file). If zone_for_shot returns 'Man to Man'
+    we map to 'Man', else 'Zone'.
     """
     try:
-        zlbl = zone_for_shot(_row_pbp_for_parsing(row), _row_shot_index(row))
+        zlbl = zone_for_shot(_row_possession_text(row), _row_shot_index(row))  # defined later
     except Exception:
         zlbl = "Man to Man"
     return "Man" if (str(zlbl).strip().lower().startswith("man")) else "Zone"
-
-# ---- Convenience: enrich a raw row with parsed display fields (for UI/exports) ----
-def enrich_row_basic_fields(row: dict) -> dict:
-    """
-    Returns a copy of `row` with:
-      shooter, onball_defender, assister, screen_assists, result, points
-    """
-    out = dict(row)
-    shooter, defenders_disp, assister, screen_list, _ = _row_roles_and_lines(row)
-
-    # blocker names from PBP (if Section 1 helper exists)
-    try:
-        pbp = _row_pbp_for_parsing(row)
-        line = _nth_shot_line(pbp, _row_shot_index(row))
-        blockers = parse_blockers_from_pbp(pbp, prefer_line=line)
-    except Exception:
-        blockers = []
-
-    res = _row_result(row)
-    x, y = _row_xy(row)
-    val  = _row_shot_value(x, y)
-    pts  = points_from_shot(res, val)
-
-    out.update({
-        "shooter": shooter,
-        "onball_defender": defenders_disp,
-        "assister": assister,
-        "screen_assists": ", ".join(screen_list) if screen_list else "",
-        "blockers": ", ".join(blockers) if blockers else "",
-        "result": res,
-        "points": pts,
-    })
-
-    # zero-shot extras (LBTO/DBTO, steals) if applicable
-    try:
-        if is_zero_shot_possession(row):
-            z = extract_zero_shot_events(row)
-            out["turnover_by"] = z.get("turnover_by", "")
-            out["turnover_type"] = z.get("turnover_type", "")
-            out["steal_by"] = z.get("steal_by", "")
-    except Exception:
-        pass
-
-    return out
 
 # ---- Filter predicate --------------------------------------------------------------
 
@@ -1717,11 +1590,16 @@ def _any_match_ci(options: set[str] | list[str], value: str) -> bool:
     return False
 
 def _collect_action_codes(actions: list[dict]) -> set[str]:
+    """
+    Collect action type codes, **restricted to actions connected to the shot**
+    when that flag is present (connected_to_shot/shot_connected).
+    """
     out = set()
     for a in (actions or []):
         t = (a.get("type") or "").lower()
         if not t:
             continue
+        # If Section 1 provided connectivity flags, require them to be True.
         if "connected_to_shot" in a or "shot_connected" in a:
             if not (bool(a.get("connected_to_shot")) or bool(a.get("shot_connected"))):
                 continue
@@ -1729,24 +1607,32 @@ def _collect_action_codes(actions: list[dict]) -> set[str]:
     return out
 
 def _passes_date_range(row: dict, start_key: str, end_key: str) -> bool:
-    k = _row_practice_date_key(row)
+    """
+    start_key/end_key are normalized strings produced externally (e.g., '2025-09-12').
+    We compare on best-effort basis: if row key lacks year ('MM-DD'), we match month/day.
+    """
+    k = _row_practice_date_key(row)  # e.g., '2025-09-12' or '09-12'
     if not (start_key or end_key):
         return True
     if not k:
         return False
 
     def _split_isoish(s):
+        # returns (Y?, M, D) where Y may be ''
         if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
             y,m,d = s.split("-"); return (y,int(m),int(d))
         if re.match(r"^\d{2}-\d{2}$", s):
             m,d = s.split("-"); return ("",int(m),int(d))
+        # last resort: try again
         s2 = _normalize_date_str(s)
         return _split_isoish(s2) if s2 != s else ("",0,0)
 
     ry, rm, rd = _split_isoish(k)
 
     def _cmp(a, b):
+        # compare dates with optional year ('' treated as wildcard)
         ay,am,ad = a; by,bm,bd = b
+        # If either has '', compare month/day only
         if not ay or not by:
             return (am,ad) < (bm,bd)
         return (ay,am,ad) < (by,bm,bd)
@@ -1755,18 +1641,38 @@ def _passes_date_range(row: dict, start_key: str, end_key: str) -> bool:
 
     if start_key:
         sk = _split_isoish(start_key)
-        if _cmp(rk, sk):
+        if _cmp(rk, sk):  # row < start
             return False
     if end_key:
         ek = _split_isoish(end_key)
-        if _cmp(ek, rk):
+        if _cmp(ek, rk):  # end < row
             return False
     return True
 
 def row_passes_shooting_filters(row: dict, filters: dict) -> bool:
+    """
+    Shooting-tab filters (practice dates, drill size & label, shooter, defenders,
+    assister, screen assister, on-ball action, off-ball action, defense Man/Zone).
+    The 'filters' dict can contain:
+      {
+        "date_start": "YYYY-MM-DD" or "MM-DD" or free-text,
+        "date_end":   same as above,
+        "drill_size": set[str] like {"5v5","3v3"},
+        "drill_full": set[str] like {"5v5 Stags"},
+        "shooter":    set[str] of full names or partials,
+        "defenders":  set[str] of full names or partials (any match),
+        "assister":   set[str],
+        "screen_ast": set[str],
+        "onball":     set[str] of codes (e.g., {"pnr","pnp"}),
+        "offball":    set[str] of codes (e.g., {"pn","bd"}),
+        "defense":    set[str] subset of {"Man","Zone"},
+      }
+    """
+    # Dates
     if not _passes_date_range(row, filters.get("date_start",""), filters.get("date_end","")):
         return False
 
+    # Drill size / full label
     ds = _row_drill_size(row)
     if filters.get("drill_size"):
         if ds not in filters["drill_size"]:
@@ -1775,7 +1681,8 @@ def row_passes_shooting_filters(row: dict, filters: dict) -> bool:
         if _row_drill_label(row) not in filters["drill_full"]:
             return False
 
-    shooter, defenders_disp, assister, screen_list, _cand_lines = _row_roles_and_lines(row)
+    # Roles (already canonicalized in _row_roles_and_lines)
+    shooter, defenders_disp, assister, screen_list, cand_lines = _row_roles_and_lines(row)
 
     if filters.get("shooter"):
         if not any(_str_in_ci(s, shooter) for s in filters["shooter"]):
@@ -1794,6 +1701,7 @@ def row_passes_shooting_filters(row: dict, filters: dict) -> bool:
         if not any(_str_in_ci(s, joined) for s in filters["screen_ast"]):
             return False
 
+    # Actions
     onball, offball = _row_onball_offball_actions(row)
     if filters.get("onball"):
         wanted = set(c.lower() for c in (filters["onball"] or []))
@@ -1809,9 +1717,11 @@ def row_passes_shooting_filters(row: dict, filters: dict) -> bool:
             bh = a.get("bh")
             sc = a.get("screener")
 
+            # Case A: shot directly connected to this action by the ball-handler
             if (a.get("connected_to_shot") or a.get("shot_connected")) and shooter and bh and shooter == bh:
                 return True
 
+            # Case B: for non-direct-only actions, include BH-assisted make by the screener
             if t not in DIRECT_ONLY and shooter and assister and sc and bh:
                 if shooter == sc and assister == bh:
                     return True
@@ -1826,6 +1736,7 @@ def row_passes_shooting_filters(row: dict, filters: dict) -> bool:
         if not (codes & set([c.lower() for c in (filters["offball"] or [])])):
             return False
 
+    # Defense
     if filters.get("defense"):
         if _row_defense_label(row) not in filters["defense"]:
             return False
@@ -1834,7 +1745,19 @@ def row_passes_shooting_filters(row: dict, filters: dict) -> bool:
 
 
 # ======================= NEW (mk12-rtg hook): PF/PA scaffolding helpers =======================
+# These **do not** change any behavior by themselves. Later aggregation code can:
+#   1) call `_row_points_scored(row)` to get points from a made shot (2 or 3),
+#   2) credit PF to all players on the offensive lineup for that row,
+#      and PA to all players on the defensive lineup for that row,
+#   3) then compute ORtg/DRtg/NET/+/- using the helpers defined in Section 1.
+
 def _row_points_scored(row: dict) -> int:
+    """
+    Returns the team points scored on this possession from a shot:
+      - 2 or 3 for a made field goal (using xy to classify arc),
+      - 0 otherwise.
+    (Free throws not modeled here; if you encode them elsewhere, handle there.)
+    """
     res = _row_result(row)
     if res != "Make":
         return 0
@@ -1843,10 +1766,15 @@ def _row_points_scored(row: dict) -> int:
     return points_from_shot(res, val)
 
 def award_pf_pa(totals_by_player: dict, offense_list: list[str], defense_list: list[str], pts: int):
+    """
+    Increment PF for each offensive player, and PA for each defensive player.
+    - totals_by_player[name] is expected to be a dict-like accumulator.
+    - Creates and increments 'PF'/'PA' keys safely.
+    """
     if pts <= 0:
         return
     for nm in (offense_list or []):
-        if not nm:
+        if not nm: 
             continue
         rec = totals_by_player.setdefault(nm, {})
         rec["PF"] = rec.get("PF", 0) + pts
@@ -1865,15 +1793,17 @@ def award_pf_pa(totals_by_player: dict, offense_list: list[str], defense_list: l
 
 #------------------------------------------------Section 3-----------------------------------------------------
 
+
 # ---- Shot collection & Shooting Stats ---------------------------------------------
 
 def collect_shots_for_filters(possession_rows: list[dict], filters: dict):
     """
-    Returns list of dicts for plotting + statting (only rows that pass filters and have x/y):
+    Returns list of dicts for plotting + statting:
       {
         x, y, result('Make'/'Miss'), value(2/3), points(int),
         shooter, defenders, assister, screen_assists[list], row_ref
       }
+    Only includes rows that pass row_passes_shooting_filters.
     """
     out = []
     for row in (possession_rows or []):
@@ -1881,48 +1811,61 @@ def collect_shots_for_filters(possession_rows: list[dict], filters: dict):
             continue
         x, y = _row_xy(row)
         res = _row_result(row)
-        if x is None or y is None or res not in ("Make", "Miss"):
-            # keep plotting data clean — only shots with coordinates
+        if x is None or y is None or res not in ("Make","Miss"):
+            # This shot cannot contribute to chart/percentages
             continue
+        shooter, defenders_disp, assister, screen_list, _cand = _row_roles_and_lines(row)
+        val = _row_shot_value(x,y)
 
-        shooter, defenders_disp, assister, screen_list, _ = _row_roles_and_lines(row)
-        val = _row_shot_value(x, y)
-        pts = points_from_shot(res, val) if 'points_from_shot' in globals() else (3 if (res == "Make" and val == 3) else (2 if (res == "Make" and val == 2) else 0))
+        # -------- NEW (mk10-PTS): per-shot points using Section 1 helper ----------
+        try:
+            pts = points_from_shot(res, val) if 'points_from_shot' in globals() else (3 if (res=="Make" and val==3) else (2 if (res=="Make" and val==2) else 0))
+        except Exception:
+            pts = 0
+        # --------------------------------------------------------------------------
 
         out.append({
             "x": x, "y": y, "result": res, "value": val,
-            "points": pts,
+            "points": pts,                                # <-- NEW: include points on each shot
             "shooter": shooter, "defenders": defenders_disp,
             "assister": assister,
-            "screen_assists": screen_list or [],
+            "screen_assists": screen_list or [],          # <-- already parsed; used for SA aggregation
             "row_ref": row
         })
     return out
 
-
 def compute_shooting_totals(filtered_shots: list[dict]) -> dict:
     """
-    Compute left-panel shooting metrics:
-      FGM, FGA, FG%, 2PM, 2PA, 2P%, 3PM, 3PA, 3P%, PTS
+    Compute the left-panel shooting metrics:
+      FGM, FGA, FG%, 2PM, 2PA, 2P%, 3PM, 3PA, 3P%,  PTS (NEW)
     """
-    shots = filtered_shots or []
-    FGA = len(shots)
-    FGM = sum(1 for s in shots if s.get("result") == "Make")
-    twos = [s for s in shots if s.get("value") == 2]
-    thrs = [s for s in shots if s.get("value") == 3]
+    FGA = len(filtered_shots or [])
+    FGM = sum(1 for s in filtered_shots if s.get("result") == "Make")
+    twos = [s for s in (filtered_shots or []) if s.get("value") == 2]
+    thrs = [s for s in (filtered_shots or []) if s.get("value") == 3]
     twoA = len(twos); twoM = sum(1 for s in twos if s.get("result") == "Make")
     thrA = len(thrs); thrM = sum(1 for s in thrs if s.get("result") == "Make")
-    PTS  = sum(int(s.get("points") or 0) for s in shots)
 
-    def pct(m, a): return round((100.0 * m / a), 1) if a else 0.0
+    # -------- NEW (mk10-PTS): team points from filtered set -----------------------
+    PTS = sum(int(s.get("points") or 0) for s in (filtered_shots or []))
+    # ------------------------------------------------------------------------------
+
+    def pct(m,a):
+        return round((100.0*m/a), 1) if a else 0.0
 
     return {
-        "FGM": FGM, "FGA": FGA, "FG%": pct(FGM, FGA),
-        "2PM": twoM, "2PA": twoA, "2P%": pct(twoM, twoA),
-        "3PM": thrM, "3PA": thrA, "3P%": pct(thrM, thrA),
+        "FGM": FGM,
+        "FGA": FGA,
+        "FGP": pct(FGM, FGA),
+        "2PM": twoM,
+        "2PA": twoA,
+        "2PP": pct(twoM, twoA),
+        "3PM": thrM,
+        "3PA": thrA,
+        "3PP": pct(thrM, thrA),
+        # NEW: expose PTS so later sections (or the header) can display team points if desired
         "PTS": PTS,
     }
-
 
 # ---- Convenience builder for default (no filters) ---------------------------------
 
@@ -1936,28 +1879,35 @@ def empty_shooting_filters() -> dict:
         "defense": set(),  # subset of {"Man","Zone"}
     }
 
-
-# ========================= Defensive / Rebound / Special tokens (from shorthand) =========================
+# ========================= NEW: Defensive / Rebound / Special tokens (from shorthand) =========================
 # Supports tokens:
 #   r (defensive rebound), or (offensive rebound),
 #   f (defensive foul), of (offensive foul),
 #   lbto (live-ball TO), dbto (dead-ball TO),
 #   stlN (steal by N), blkN (block by N), defN (deflection by N)
+# Numbers may be attached before the code (e.g., "10r", "10/11or", "5f"), and
+# for TO/foul codes the number may be omitted; we then use current possession context.
 
 _NUM_ONLY_RE   = re.compile(r"^\d+$")
+# minimal on-ball shorthand recognizer to advance "current ballhandler/defender"
 _ONBALL_SH_RE  = re.compile(r"(?<!\S)(?P<bh>\d+)(?:/(?P<def>\d+))?(?P<act>h|d|p|pnr|pnp|dho|ho|kp|rj|slp|gst)\b", re.IGNORECASE)
+# NEW: allow bare guarded pair (no action) to set context, e.g., "10/11"
 _PAIR_ONLY_RE  = re.compile(r"(?<!\S)(?P<bh>\d+)\s*/\s*(?P<def>\d+)(?!\w)", re.IGNORECASE)
+# rebound / specials
 _DEF_REB_RE    = re.compile(r"(?<!\S)(?P<p>\d+)(?:/\d+)?r(?!\w)", re.IGNORECASE)
 _OFF_REB_RE    = re.compile(r"(?<!\S)(?P<p>\d+)(?:/\d+)?or(?!\w)", re.IGNORECASE)
-_STEAL_RE      = re.compile(r"(?<!\S)(?:stl(?P<p2>\d+)|(?P<p1>\d+)stl)(?!\w)", re.IGNORECASE)
-_BLOCK_RE      = re.compile(r"(?<!\S)(?:blk(?P<p2>\d+)|(?P<p1>\d+)blk)(?!\w)", re.IGNORECASE)
-_DEFLECT_RE    = re.compile(r"(?<!\S)(?:def(?P<p2>\d+)|(?P<p1>\d+)def)(?!\w)", re.IGNORECASE)
+# accept "15stl" or "stl15", etc.
+_STEAL_RE   = re.compile(r"(?<!\S)(?:stl(?P<p2>\d+)|(?P<p1>\d+)stl)(?!\w)", re.IGNORECASE)
+_BLOCK_RE   = re.compile(r"(?<!\S)(?:blk(?P<p2>\d+)|(?P<p1>\d+)blk)(?!\w)", re.IGNORECASE)
+_DEFLECT_RE = re.compile(r"(?<!\S)(?:def(?P<p2>\d+)|(?P<p1>\d+)def)(?!\w)", re.IGNORECASE)
 _LBTO_RE       = re.compile(r"(?<!\S)(?:(?P<p>\d+)?)lbto(?!\w)", re.IGNORECASE)
 _DBTO_RE       = re.compile(r"(?<!\S)(?:(?P<p>\d+)?)dbto(?!\w)", re.IGNORECASE)
+# FIX: capture optional jersey digits for fouls (was empty group before)
 _DFOUL_RE      = re.compile(r"(?<!\S)(?:(?P<p>\d+)?)f(?!\w)", re.IGNORECASE)
 _OFOUL_RE      = re.compile(r"(?<!\S)(?:(?P<p>\d+)?)of(?!\w)", re.IGNORECASE)
 
 def _name_from_num(num: str) -> str:
+    """Return roster display name for a jersey number string, else the number."""
     roster = _get_roster_cache()
     s = (num or "").strip()
     if not s:
@@ -1970,12 +1920,24 @@ def _name_from_num(num: str) -> str:
 
 def parse_special_stats_from_shorthand(short_text: str):
     """
-    Parse shorthand (e.g., '10r 1/3h 4/5d- 10/11or def5 lbto stl11') and return:
+    Parse shorthand string (e.g., '10r 1/3h 4/5d- 10/11or def5 lbto stl11') and return a dict:
       {
-        "def_rebounds": [], "off_rebounds": [], "deflections": [],
-        "steals": [], "blocks": [], "live_ball_to": [], "dead_ball_to": [],
-        "def_fouls": [], "off_fouls": [], "events": [ {"code":"or","player":"..."} ... ]
+        "def_rebounds": [names...],
+        "off_rebounds": [names...],
+        "deflections":  [names...],
+        "steals":       [names...],
+        "blocks":       [names...],
+        "live_ball_to": [names...],  # turnover by ...
+        "dead_ball_to": [names...],
+        "def_fouls":    [names...],
+        "off_fouls":    [names...],
+        "events":       [ {"code": "or", "player": "Name"}, ... ]  # in-order, if useful
       }
+
+    Resolution rules for unnumbered tokens:
+      - f (defensive foul): use current on-ball defender if available; else None.
+      - of (offensive foul): use current offensive possessor if available.
+      - lbto/dbto: use current offensive possessor (last on-ball BH or last OR rebounder).
     """
     s = (short_text or "").strip()
     if not s:
@@ -1985,9 +1947,10 @@ def parse_special_stats_from_shorthand(short_text: str):
             "def_fouls": [], "off_fouls": [], "events": []
         }
 
-    cur_bh_num = None
-    cur_bh_def_num = None
-    cur_off_possessor = None
+    # tracking context as we scan left->right
+    cur_bh_num = None           # last explicit ballhandler number (from on-ball action or bare pair)
+    cur_bh_def_num = None       # last explicit on-ball defender
+    cur_off_possessor = None    # best guess at current offensive possessor (BH or OR rebounder)
 
     out = {
         "def_rebounds": [], "off_rebounds": [], "deflections": [],
@@ -2000,6 +1963,7 @@ def parse_special_stats_from_shorthand(short_text: str):
         if not tok:
             continue
 
+        # 0) bare "off/def" pair (no action) sets context (e.g., '1/20')
         m_pair = _PAIR_ONLY_RE.fullmatch(tok)
         if m_pair:
             cur_bh_num = m_pair.group("bh")
@@ -2007,50 +1971,67 @@ def parse_special_stats_from_shorthand(short_text: str):
             cur_off_possessor = cur_bh_num or cur_off_possessor
             continue
 
+        # 1) update BH/DEF from on-ball micro-actions
         m_bh = _ONBALL_SH_RE.search(tok)
         if m_bh:
             cur_bh_num = m_bh.group("bh")
             cur_bh_def_num = m_bh.group("def") or cur_bh_def_num
             cur_off_possessor = cur_bh_num or cur_off_possessor
 
+        # 2) rebounds
         m = _DEF_REB_RE.match(tok)
         if m:
-            p = m.group("p"); name = _name_from_num(p)
-            out["def_rebounds"].append(name); out["events"].append({"code":"r", "player": name})
+            p = m.group("p")
+            name = _name_from_num(p)
+            out["def_rebounds"].append(name)
+            out["events"].append({"code":"r", "player": name})
+            # possession flips; offensive possessor becomes None
             cur_off_possessor = None
             continue
 
         m = _OFF_REB_RE.match(tok)
         if m:
-            p = m.group("p"); name = _name_from_num(p)
-            out["off_rebounds"].append(name); out["events"].append({"code":"or", "player": name})
+            p = m.group("p")
+            name = _name_from_num(p)
+            out["off_rebounds"].append(name)
+            out["events"].append({"code":"or", "player": name})
+            # offense keeps; new possessor is rebounder
             cur_off_possessor = p
             continue
 
+        # 3) steals, blocks, deflections (dual-order)
         m = _STEAL_RE.match(tok)
         if m:
-            p = m.group("p1") or m.group("p2"); name = _name_from_num(p)
-            out["steals"].append(name); out["events"].append({"code":"stl", "player": name})
+            p = m.group("p1") or m.group("p2")
+            name = _name_from_num(p)
+            out["steals"].append(name)
+            out["events"].append({"code":"stl", "player": name})
             continue
 
         m = _BLOCK_RE.match(tok)
         if m:
-            p = m.group("p1") or m.group("p2"); name = _name_from_num(p)
-            out["blocks"].append(name); out["events"].append({"code":"blk", "player": name})
+            p = m.group("p1") or m.group("p2")
+            name = _name_from_num(p)
+            out["blocks"].append(name)
+            out["events"].append({"code":"blk", "player": name})
             continue
 
         m = _DEFLECT_RE.match(tok)
         if m:
-            p = m.group("p1") or m.group("p2"); name = _name_from_num(p)
-            out["deflections"].append(name); out["events"].append({"code":"def", "player": name})
+            p = m.group("p1") or m.group("p2")
+            name = _name_from_num(p)
+            out["deflections"].append(name)
+            out["events"].append({"code":"def", "player": name})
             continue
 
+        # 4) turnovers (may be unnumbered)
         m = _LBTO_RE.match(tok)
         if m:
             p = m.group("p") or cur_off_possessor or cur_bh_num
             name = _name_from_num(p or "")
             if name:
-                out["live_ball_to"].append(name); out["events"].append({"code":"lbto", "player": name})
+                out["live_ball_to"].append(name)
+                out["events"].append({"code":"lbto", "player": name})
             continue
 
         m = _DBTO_RE.match(tok)
@@ -2058,15 +2039,18 @@ def parse_special_stats_from_shorthand(short_text: str):
             p = m.group("p") or cur_off_possessor or cur_bh_num
             name = _name_from_num(p or "")
             if name:
-                out["dead_ball_to"].append(name); out["events"].append({"code":"dbto", "player": name})
+                out["dead_ball_to"].append(name)
+                out["events"].append({"code":"dbto", "player": name})
             continue
 
+        # 5) fouls (may be unnumbered)
         m = _DFOUL_RE.match(tok)
         if m:
             p = m.group("p") or cur_bh_def_num
             name = _name_from_num(p or "")
             if name:
-                out["def_fouls"].append(name); out["events"].append({"code":"f", "player": name})
+                out["def_fouls"].append(name)
+                out["events"].append({"code":"f", "player": name})
             continue
 
         m = _OFOUL_RE.match(tok)
@@ -2074,10 +2058,13 @@ def parse_special_stats_from_shorthand(short_text: str):
             p = m.group("p") or cur_off_possessor or cur_bh_num
             name = _name_from_num(p or "")
             if name:
-                out["off_fouls"].append(name); out["events"].append({"code":"of", "player": name})
+                out["off_fouls"].append(name)
+                out["events"].append({"code":"of", "player": name})
             continue
 
-    # de-dup lists while preserving order
+        # (ignore other tokens; this function is focused on specials)
+
+    # de-dup lists while preserving order (optional but tidy)
     def _dedupe(seq):
         seen = set(); out_list = []
         for x in seq:
@@ -2092,9 +2079,9 @@ def parse_special_stats_from_shorthand(short_text: str):
 
     return out
 
+# ===================== NEW: Zone-defense & participant harvesting =====================
 
-# ===================== Zone-defense & participant harvesting =====================
-
+# Recognize zone tags like "2-3[...]", "3-2[...]", "1-3-1[...]", or "matchup[...]"
 _ZONE_TAG_RE = re.compile(r"(?i)\b(?P<label>(?:\d(?:-\d){1,3}|matchup))\s*\[(?P<body>.*?)\]", re.DOTALL)
 
 def _normspace(s: str) -> str:
@@ -2106,68 +2093,83 @@ def _normalize_zone_label(lbl: str) -> str:
     lbl = lbl.strip().lower()
     if lbl == "matchup":
         return "Matchup Zone"
+    # keep numeric shapes as-is (e.g., 2-3, 1-3-1)
     return f"{lbl.upper()} Zone" if re.match(r"^\d(?:-\d){1,3}$", lbl) else f"{lbl.title()} Zone"
 
 def zone_for_shot(pbp_text: str, shot_index: int) -> str:
     """
-    If the shot line is inside any <ZONE>[ ... ] block, return that zone label; else 'Man to Man'.
+    Determine defense for the nth shot in a possession:
+      - If the shot line is contained within any <ZONE>[ ... ] chunk, return "<ZONE> Zone"
+      - Otherwise default to "Man to Man"
     """
     shot_line = _nth_shot_line(pbp_text or "", shot_index)
     if not shot_line:
         return "Man to Man"
     shot_norm = _normspace(shot_line)
 
-    for m in re.finditer(_ZONE_TAG_RE, pbp_text or ""):
+    txt = pbp_text or ""
+    for m in re.finditer(_ZONE_TAG_RE, txt):
         lbl = _normalize_zone_label(m.group("label") or "")
         body = _normspace(m.group("body") or "")
+        # direct containment check on normalized whitespace
         if shot_norm and shot_norm in body:
             return lbl or "Man to Man"
     return "Man to Man"
 
-
 def collect_players_from_possession(pbp_text: str, shorthand_text: str):
     """
-    Harvest offense/defense players from:
-      - 'guarded by' pairs (all lines),
-      - assist + screen assist names (offense),
-      - natural-language blockers (defense),
-      - shorthand micro-actions like '10/11h' (offense/defense jerseys).
-    Returns (offense_list, defense_list).
+    Harvest lists of offensive and defensive players the parser can see
+    from a possession via:
+      - Guarded-by pairs across all lines (on-ball + off-ball)
+      - Assister + screen-assist names (offense)
+      - Shot-blockers in PBP text (defense)
+      - Shorthand pairs like '10/11h' (left=offense, right=defense)
+    Returns (offense_list, defense_list) de-duped, order preserved.
     """
     off_list, def_list = [], []
     seen_off, seen_def = set(), set()
 
     def _add_off(nm: str):
-        nm = _strict_canon_name(nm); k = (nm or "").lower()
-        if nm and k not in seen_off: off_list.append(nm); seen_off.add(k)
+        nm = _strict_canon_name(nm)
+        k = (nm or "").lower()
+        if nm and k not in seen_off:
+            off_list.append(nm); seen_off.add(k)
 
     def _add_def(nm: str):
-        nm = _strict_canon_name(nm); k = (nm or "").lower()
-        if nm and k not in seen_def: def_list.append(nm); seen_def.add(k)
+        nm = _strict_canon_name(nm)
+        k = (nm or "").lower()
+        if nm and k not in seen_def:
+            def_list.append(nm); seen_def.add(k)
 
+    # 1) From all 'guarded by' pairs in the full text (covers on-ball & off-ball lines)
     for ln in (pbp_text or "").splitlines():
         for a, b in _all_guard_pairs_in_line(ln):
             if a: _add_off(a)
             if b: _add_def(b)
 
+    # 2) From assist + screen assist cues (offense)
     assister = _parse_assister(pbp_text or "", prefer_line="")
     if assister: _add_off(assister)
     for nm in _parse_screen_assister(pbp_text or "", prefer_line=""):
         _add_off(nm)
 
+    # 3) From natural-language blockers (defense)
     for nm in parse_blockers_from_pbp(pbp_text or "", prefer_line=""):
         _add_def(nm)
 
+    # 4) From shorthand micro-actions like '10/11h' (left=offense, right=defense)
     for tok in re.split(r"\s+", shorthand_text or ""):
         m = _ONBALL_SH_RE.search(tok or "")
         if not m:
             continue
-        bh = m.group("bh"); df = m.group("def")
-        if bh: _add_off(_name_from_num(bh))
-        if df: _add_def(_name_from_num(df))
+        bh = m.group("bh")
+        df = m.group("def")
+        if bh:
+            _add_off(_name_from_num(bh))
+        if df:
+            _add_def(_name_from_num(df))
 
     return off_list, def_list
-
 
 # ------------------------- Geometry precompute -------------------------
 mini_radius = FT_CY - RIM_Y
@@ -2194,38 +2196,56 @@ LEFT_DIAG_IX, LEFT_DIAG_IY = _three_point_intersection(*LEFT_DIAG_START, LEFT_DI
 RIGHT_DIAG_IX, RIGHT_DIAG_IY = _three_point_intersection(*RIGHT_DIAG_START, RIGHT_DIAG_SLOPE, go_right=True)
 
 
-# ====================== Advanced table projection helpers ======================
+# ====================== NEW (mk9-adv): helpers to split basic vs advanced rows ======================
+# These additive utilities let later sections *move* OP/DP out of the primary stats
+# table and into the new Advanced Stats table, without altering existing aggregation
+# code. They rely on the Section 1 definitions: ADVANCED_STATS_KEYS and
+# build_advanced_row(...). If Section 1 isn't imported in this module scope,
+# ensure those names are available before calling these helpers.
 
 def remove_advanced_keys_from_row(player_row: dict) -> dict:
     """
-    Return a copy of player_row with advanced keys removed (keeps main table clean).
+    Return a *copy* of player_row with OP/DP removed (if present).
+    This keeps the main table free of advanced columns.
     """
     try:
         pr = dict(player_row or {})
-        for k in (ADVANCED_STATS_KEYS if 'ADVANCED_STATS_KEYS' in globals() else ["OP", "DP"]):
+        for k in (ADVANCED_STATS_KEYS if 'ADVANCED_STATS_KEYS' in globals() else ["OP","DP"]):
             pr.pop(k, None)
         return pr
     except Exception:
+        # On any unexpected shape, just return a shallow copy untouched.
         return dict(player_row or {})
 
 def project_advanced_from_basic_rows(player_rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Given a list of per-player rows (that may include OP/DP), produce:
+      - basic_rows_no_adv: same rows but with OP/DP removed
+      - advanced_rows: rows shaped for the Advanced table (Player, OP, DP)
+    """
     basic_rows_no_adv = []
     advanced_rows = []
     for r in (player_rows or []):
         basic_rows_no_adv.append(remove_advanced_keys_from_row(r))
+        # Use Section 1 builder if present; otherwise build a minimal row.
         if 'build_advanced_row' in globals():
             advanced_rows.append(build_advanced_row(r))
         else:
-            advanced_rows.append({"Player": r.get("Player",""), "OP": r.get("OP", 0), "DP": r.get("DP", 0)})
+            advanced_rows.append({
+                "Player": r.get("Player",""),
+                "OP": r.get("OP", 0),
+                "DP": r.get("DP", 0),
+            })
     return basic_rows_no_adv, advanced_rows
+# ==================== END (mk9-adv): basic vs advanced split helpers ====================
 
-
-# ==================== Per-player aggregation helpers (PTS/SA & advanced metrics) ====================
-
+# ==================== NEW (mk10-PTS+SA): helpers for per-player aggregation ====================
 def add_pts_sa_to_player_accum(accum: dict, shot: dict):
     """
-    accum['PTS'] += shot['points']
-    (SA tallied separately via accumulate_screen_assists)
+    Mutate an accumulator dict for a player using one shot dict from collect_shots_for_filters():
+      - accum['PTS'] += shot['points']
+      - for each name in shot['screen_assists'], that player's accum['SA'] += 1
+    NOTE: This is a neutral helper that later sections can call during per-player rollups.
     """
     if not isinstance(accum, dict) or not isinstance(shot, dict):
         return
@@ -2235,15 +2255,24 @@ def add_pts_sa_to_player_accum(accum: dict, shot: dict):
         pass
 
 def accumulate_screen_assists(sa_map: dict, shot: dict):
+    """
+    Bump SA counts for screen-assist players for a given shot:
+      sa_map[name] += 1
+    This is separated so the caller can add SA to the correct player's row later.
+    """
     if not isinstance(sa_map, dict) or not isinstance(shot, dict):
         return
     for nm in (shot.get("screen_assists") or []):
         if not nm:
             continue
-        sa_map[str(nm)] = int(sa_map.get(str(nm), 0)) + 1
+        key = str(nm)
+        sa_map[key] = int(sa_map.get(key, 0)) + 1
+# ================= END (mk10-PTS+SA): helpers for per-player aggregation =================
 
 
+# ==================== NEW (mk11-advstats): calculators & projection helpers ====================
 def _g(row, key, default=0):
+    """Safe getter with numeric coercion for stat rows."""
     try:
         v = row.get(key, default)
         return float(v)
@@ -2252,98 +2281,132 @@ def _g(row, key, default=0):
 
 def compute_adv_metrics_for_row(row: dict) -> dict:
     """
-    eFG% = (FGM + 0.5*3PM)/FGA *100
-    PPS  = PTS / FGA
-    AST% = 100*(AST/OP), TOV% = 100*(TO/OP), AST/TO = AST/TO
+    Fill derived advanced metrics on a per-player row *in place* using
+    the formulas requested:
+      eFG% = (FGM + 0.5*3PM) / FGA * 100
+      PPS  = PTS / FGA
+      AST% = 100*(AST / OP)
+      TOV% = 100*(TO  / OP)
+      AST/TO = AST / TO
+    Missing inputs are treated as 0; division by 0 -> 0.
     """
     if not isinstance(row, dict):
         return row
 
-    fgm = _g(row, "FGM"); fga = _g(row, "FGA"); tpm = _g(row, "3PM")
-    pts = _g(row, "PTS"); ast = _g(row, "AST"); tov = _g(row, "TO"); op = _g(row, "OP")
+    fgm = _g(row, "FGM")
+    fga = _g(row, "FGA")
+    tpm = _g(row, "3PM")
+    pts = _g(row, "PTS")
+    ast = _g(row, "AST")
+    tov = _g(row, "TO")
+    op  = _g(row, "OP")
 
-    row["eFG%"] = calc_efg_percent(fgm, tpm, fga) if 'calc_efg_percent' in globals() else (100.0 * ((fgm + 0.5 * tpm) / fga) if fga else 0.0)
-    row["PPS"]  = calc_pps(pts, fga)              if 'calc_pps' in globals()         else ((pts / fga) if fga else 0.0)
-    row["AST%"] = calc_ast_percent(ast, op)       if 'calc_ast_percent' in globals()  else (100.0 * (ast / op) if op else 0.0)
-    row["TOV%"] = calc_tov_percent(tov, op)       if 'calc_tov_percent' in globals()  else (100.0 * (tov / op) if op else 0.0)
-    row["AST/TO"]= calc_ast_to_ratio(ast, tov)    if 'calc_ast_to_ratio' in globals() else ((ast / tov) if tov else 0.0)
+    # Use Section 1 calc helpers if available for consistency
+    if 'calc_efg_percent' in globals():
+        row["eFG%"] = calc_efg_percent(fgm, tpm, fga)
+    else:
+        row["eFG%"] = 100.0 * ((fgm + 0.5 * tpm) / fga) if fga else 0.0
+
+    if 'calc_pps' in globals():
+        row["PPS"] = calc_pps(pts, fga)
+    else:
+        row["PPS"] = (pts / fga) if fga else 0.0
+
+    if 'calc_ast_percent' in globals():
+        row["AST%"] = calc_ast_percent(ast, op)
+    else:
+        row["AST%"] = 100.0 * (ast / op) if op else 0.0
+
+    if 'calc_tov_percent' in globals():
+        row["TOV%"] = calc_tov_percent(tov, op)
+    else:
+        row["TOV%"] = 100.0 * (tov / op) if op else 0.0
+
+    if 'calc_ast_to_ratio' in globals():
+        row["AST/TO"] = calc_ast_to_ratio(ast, tov)
+    else:
+        row["AST/TO"] = (ast / tov) if tov else 0.0
+
     return row
 
 def compute_adv_metrics_for_rows(rows: list[dict]) -> list[dict]:
+    """
+    Compute and inject advanced metrics for each player row.
+    Returns the same list object for convenience.
+    """
     for r in (rows or []):
         compute_adv_metrics_for_row(r)
     return rows
 
 def project_advanced_with_metrics(player_rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Convenience wrapper that:
+      1) Computes advanced metrics onto each player row.
+      2) Builds the Advanced table rows via build_advanced_row().
+      3) Returns (basic_rows_without_advanced_keys, advanced_rows_with_new_metrics).
+    """
     compute_adv_metrics_for_rows(player_rows)
     return project_advanced_from_basic_rows(player_rows)
+# ==================== END (mk11-advstats) ====================
 
 
-# ==================== Specials from possessions (even with no shot) ====================
-
+# ==================== NEW (mk11-noshoot-specials): bring in specials from no-shot possessions ====================
 def row_passes_nonshot_filters(row: dict, filters: dict) -> bool:
     """
-    Date/drill/defense screens only — ignores shooter/assister-specific filters.
+    Filters for possessions even when there is NO valid shot recorded.
+    Uses the same date/drill/defense filters; ignores shooter/assister-specific filters.
     """
     if not _passes_date_range(row, filters.get("date_start",""), filters.get("date_end","")):
         return False
+
     ds = _row_drill_size(row)
     if filters.get("drill_size") and ds not in filters["drill_size"]:
         return False
+
     if filters.get("drill_full") and _row_drill_label(row) not in filters["drill_full"]:
         return False
+
     if filters.get("defense") and _row_defense_label(row) not in filters["defense"]:
         return False
+
     return True
 
 
 def collect_special_events_for_filters(possession_rows: list[dict], filters: dict):
     """
-    Collect specials (TO, STL, BLK, DEF, ORB/DRB, fouls) from all matching rows.
-    Pulls from shorthand; augments BLK from natural-language PBP (names resolved).
+    Collect a flat list of special events (including turnovers/steals) from ALL
+    matching rows, regardless of whether a shot exists.
     """
     events = []
-    seen = set()  # (code, player) to prevent dupes
     for row in (possession_rows or []):
         if not row_passes_nonshot_filters(row, filters or {}):
             continue
-
-        # shorthand-driven events
+        # IMPORTANT: pull shorthand codes (where the TO/STEAL entries live)
         short = _row_shorthand_text(row)
-        if short:
-            spec = parse_special_stats_from_shorthand(short)
-            key_map = {
-                "def":"deflections","stl":"steals","blk":"blocks",
-                "lbto":"live_ball_to","dbto":"dead_ball_to","or":"off_rebounds","r":"def_rebounds",
-                "f":"def_fouls","of":"off_fouls"
-            }
-            for code, list_key in key_map.items():
-                for nm in (spec.get(list_key, []) or []):
-                    key = (code, nm)
-                    if nm and key not in seen:
-                        events.append({"code": code, "player": nm}); seen.add(key)
-
-        # natural-language blockers from PBP (in case shorthand omitted blk##)
-        try:
-            pbp = _row_pbp_for_parsing(row)
-            blks = parse_blockers_from_pbp(pbp, prefer_line=_nth_shot_line(pbp, _row_shot_index(row)))
-            for nm in (blks or []):
-                key = ("blk", nm)
-                if nm and key not in seen:
-                    events.append({"code":"blk", "player": nm}); seen.add(key)
-        except Exception:
-            pass
-
+        if not short:
+            continue
+        spec = parse_special_stats_from_shorthand(short)
+        key_map = {
+            "def":"deflections","stl":"steals","blk":"blocks",
+            "lbto":"live_ball_to","dbto":"dead_ball_to","or":"off_rebounds","r":"def_rebounds",
+            "f":"def_fouls","of":"off_fouls"
+        }
+        # Pull from the structured lists (not the 'events' echo)
+        for code, list_key in key_map.items():
+            for nm in (spec.get(list_key, []) or []):
+                events.append({"code": code, "player": nm})
     return events
 
 
 def apply_specials_to_player_rows(player_rows: list[dict], possession_rows: list[dict], filters: dict):
     """
-    Mutate player_rows to bump DEF/STL/BLK/LBTO/DBTO/TO/ORB/DRB/TRB (from specials).
+    Mutate the provided player_rows by bumping DEF/STL/BLK/LBTO/DBTO/TO/ORB/DRB/TRB
+    using specials parsed from ALL possessions (even those without shots).
     """
     if not player_rows:
         return
 
+    # index by player display name already used in rows
     idx = { (r.get("Player") or ""): r for r in player_rows if r.get("Player") }
     specials = collect_special_events_for_filters(possession_rows, filters)
 
@@ -2374,9 +2437,12 @@ def apply_specials_to_player_rows(player_rows: list[dict], possession_rows: list
         elif code == "r":
             bump(row, "DRB"); bump(row, "TRB")
         elif code == "f":
-            bump(row, "DFL")  # optional if you track defensive fouls
+            bump(row, "DFL")  # optional: if you track a 'DFL' (defensive fouls) column
         elif code == "of":
-            bump(row, "OFL")  # optional if you track offensive fouls
+            bump(row, "OFL")  # optional: if you track an 'OFL' (offensive fouls) column
+# ==================== END (mk11-noshoot-specials) ====================
+
+
 
 
 # ------------------------- Zone classifier -------------------------
@@ -2554,49 +2620,57 @@ def point_in_zone(x, y, zone_id):
     return False
 
 
-# ======================= PF/PA accumulation + ratings =======================
-
+# ======================= NEW (mk12-rtg core): PF/PA accumulation + ratings =======================
 def compute_pf_pa_totals_for_filters(possession_rows: list[dict], filters: dict) -> dict:
     """
-    For each possession within filters:
-      - If a made FG occurred, award team points (2/3) to PF (offense) and PA (defense).
-    Uses name-resolved PBP via _row_pbp_for_parsing().
-    Returns: { "Full Name": {"PF": int, "PA": int}, ... }.
+    Walk through all possessions that pass the non-shot filters and award:
+      - PF to each offensive player and PA to each defensive player on MADE shots.
+    Uses:
+      - _row_points_scored(row) to get points for a made shot (2/3, else 0),
+      - collect_players_from_possession(...) to infer offense/defense lists,
+      - award_pf_pa(...) (Section 2) to increment per-player totals.
+    Returns a dict: { "Full Name": {"PF": int, "PA": int}, ... }.
     """
     totals = {}
     for row in (possession_rows or []):
         if not row_passes_nonshot_filters(row, filters or {}):
             continue
 
-        pts = _row_points_scored(row)
+        # Points scored on this possession (only on made FGs)
+        try:
+            pts = _row_points_scored(row) if '._row_points_scored' in globals() else _row_points_scored(row)
+        except Exception:
+            pts = _row_points_scored(row) if ' _row_points_scored' in globals() else 0
+
         if pts <= 0:
             continue
 
-        pbp = _row_pbp_for_parsing(row)   # <-- use names-resolved PBP
+        pbp = _row_possession_text(row)
         sh  = _row_shorthand_text(row)
         off_list, def_list = collect_players_from_possession(pbp, sh)
-
-        if not (off_list or def_list):
-            continue
 
         if 'award_pf_pa' in globals():
             award_pf_pa(totals, off_list, def_list, pts)
         else:
+            # fallback (shouldn't happen): manual increments
             for nm in (off_list or []):
                 if not nm: continue
-                rec = totals.setdefault(nm, {}); rec["PF"] = rec.get("PF", 0) + pts
+                rec = totals.setdefault(nm, {})
+                rec["PF"] = rec.get("PF", 0) + pts
             for nm in (def_list or []):
                 if not nm: continue
-                rec = totals.setdefault(nm, {}); rec["PA"] = rec.get("PA", 0) + pts
+                rec = totals.setdefault(nm, {})
+                rec["PA"] = rec.get("PA", 0) + pts
 
     return totals
 
 
 def apply_pf_pa_and_ratings_to_player_rows(player_rows: list[dict], possession_rows: list[dict], filters: dict):
     """
-    Mutates player_rows:
-      1) Adds PF/PA from possessions within filters,
-      2) Computes ORtg/DRtg/NET/+/- using Section 1 helpers (if OP/DP present).
+    Mutate each row in `player_rows` by:
+      1) Adding PF/PA accumulated from possessions within filters,
+      2) Computing ORtg, DRtg, NET, +/- using the Section 1 helpers
+         (requires OP/DP already present on the row; if not, those ratings default to 0).
     """
     if not player_rows:
         return
@@ -2611,12 +2685,16 @@ def apply_pf_pa_and_ratings_to_player_rows(player_rows: list[dict], possession_r
         row["PF"] = row.get("PF", 0) + int(t.get("PF", 0) or 0)
         row["PA"] = row.get("PA", 0) + int(t.get("PA", 0) or 0)
 
+    # Compute ratings (+/-) on each row
     if 'compute_ratings_for_row' in globals():
         for r in (player_rows or []):
             compute_ratings_for_row(r)
 
 
 def compute_ratings_for_rows(rows: list[dict]) -> list[dict]:
+    """
+    Convenience: apply compute_ratings_for_row to each row if available.
+    """
     if 'compute_ratings_for_row' not in globals():
         return rows
     for r in (rows or []):
@@ -2626,11 +2704,13 @@ def compute_ratings_for_rows(rows: list[dict]) -> list[dict]:
 
 def project_advanced_with_all_metrics(player_rows: list[dict]) -> tuple[list[dict], list[dict]]:
     """
-    Computes both advanced shot metrics and rating metrics, then projects to (basic, advanced).
+    Computes BOTH advanced shot metrics and rating metrics on player_rows,
+    then returns the projected (basic, advanced) rows for UI.
     """
     compute_adv_metrics_for_rows(player_rows)
     compute_ratings_for_rows(player_rows)
     return project_advanced_from_basic_rows(player_rows)
+# ======================= END (mk12-rtg core) =======================
 
 
 
@@ -2641,13 +2721,13 @@ def project_advanced_with_all_metrics(player_rows: list[dict]) -> tuple[list[dic
 
 #---------------------------------------------Section 4-------------------------------------------------------------------------
 
-# ---- stats (zones)
+# ---- stats
 def calculate_zone_stats(shots):
     zone_stats = {}
     for zone_id in range(1, 15):
         makes = attempts = 0
-        for shot in shots or []:
-            # Count only valid shots (Make/Miss with legal x/y)
+        for shot in shots:
+            # Harden to only count valid shots (Make/Miss with legal x/y)
             try:
                 x = float(shot.get("x")); y = float(shot.get("y"))
                 res = shot.get("result") or ""
@@ -2683,24 +2763,9 @@ def add_zone_fill(fig, zone_id, rgba="rgba(255,255,0,0.35)", step=0.25):
 
 
 # ======================================================================
-# =======================  mk5 ADDITIONS (Section 4)  ===================
+# =======================  mk5 ADDITIONS (Section 2)  ===================
 # Per-player stat aggregation for the Stats tab + filters
 # ======================================================================
-
-# Fallback: allow code here to prefer names-resolved PBP if earlier helper not present
-if '_row_pbp_for_parsing' not in globals():
-    def _row_pbp_for_parsing(row: dict) -> str:
-        return (row.get("play_by_play_names")
-                or row.get("play_by_play")
-                or _row_possession_text(row))
-
-# If callbacks hand raw rows to charts, convert to shots with default (blank) filters
-if 'rows_to_shots' not in globals():
-    def rows_to_shots(rows: list[dict]) -> list[dict]:
-        try:
-            return collect_shots_for_filters(rows, empty_shooting_filters())
-        except Exception:
-            return []
 
 # ---- Stats-tab filters (subset: dates, drill size/label, defense) -------------------
 def empty_stats_filters() -> dict:
@@ -2713,12 +2778,15 @@ def empty_stats_filters() -> dict:
 def row_passes_stats_filters(row: dict, filters: dict) -> bool:
     if not _passes_date_range(row, filters.get("date_start",""), filters.get("date_end","")):
         return False
-    if filters.get("drill_size") and _row_drill_size(row) not in filters["drill_size"]:
-        return False
-    if filters.get("drill_full") and _row_drill_label(row) not in filters["drill_full"]:
-        return False
-    if filters.get("defense") and _row_defense_label(row) not in filters["defense"]:
-        return False
+    if filters.get("drill_size"):
+        if _row_drill_size(row) not in filters["drill_size"]:
+            return False
+    if filters.get("drill_full"):
+        if _row_drill_label(row) not in filters["drill_full"]:
+            return False
+    if filters.get("defense"):
+        if _row_defense_label(row) not in filters["defense"]:
+            return False
     return True
 
 # ---- Per-player stat accumulator ----------------------------------------------------
@@ -2727,25 +2795,29 @@ def _ensure_player(bucket: dict, player: str) -> dict:
     Ensure a dict for player exists with all counters initialized.
     Returns the player's dict for in-place updates.
     """
-    name = (player or "").strip() or "Unknown"
+    name = (player or "").strip()
+    if not name:
+        name = "Unknown"
     if name not in bucket:
         bucket[name] = {
             "Player": name,
             # shooting
             "FGM":0, "FGA":0, "2PM":0, "2PA":0, "3PM":0, "3PA":0,
-            "PTS":0,       # NEW (mk10-PTS)
+            # NEW (mk10-PTS): running points
+            "PTS":0,
             # passing
             "AST":0,
-            "SA":0,        # NEW (mk10-SA): screen assists
+            # NEW (mk10-SA): screen assists
+            "SA":0,
             # rebounding
             "DRB":0, "ORB":0,
             # turnovers & fouls
-            "LBTO":0, "DBTO":0, "TO":0,
+            "LBTO":0, "DBTO":0, "TO":0, 
             # defense/specials
             "STL":0, "DEF":0, "BLK":0,
             # possession counts
             "OP":0, "DP":0,
-            # practices counted
+            # --- NEW: practices played
             "PRAC":0,
         }
     return bucket[name]
@@ -2753,63 +2825,77 @@ def _ensure_player(bucket: dict, player: str) -> dict:
 def _pct(m,a):
     try:
         return round((100.0*m/a), 1) if a else 0.0
-    except Exception:
+    except:
         return 0.0
 
-# -------------------- Practice/absence helpers (PRAC) --------------------
+# -------------------- NEW: Practice/absence helpers (PRAC) --------------------
+# We accept several possible keys the entry app may store absences under.
 _ABSENCE_KEYS = ("absences","absence_numbers","absent","absent_numbers","absent_list","missed")
 
 def _extract_absent_names_from_row(row: dict) -> set[str]:
     """
-    Pull absences from common keys. Accepts jersey numbers or names.
+    Try to pull absences from a row via common keys. Handles:
+      - list of jersey numbers or names
+      - comma/space separated strings
     Returns a set of canonical roster names.
     """
     out = set()
+    roster = _get_roster_cache()
 
     def _add_name_token(tok: str):
         tok = (tok or "").strip()
         if not tok:
             return
+        # if it's a number, map by jersey; else normalize to roster
         if re.fullmatch(r"\d{1,2}", tok):
             out.add(_name_from_num(tok))
         else:
-            out.add(_strict_canon_name(tok))
+            out.add(_normalize_to_roster(tok, roster))
 
     for k in _ABSENCE_KEYS:
-        if k not in row or row.get(k) is None:
-            continue
-        val = row.get(k)
-        if isinstance(val, list):
-            for v in val:
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    _add_name_token(str(int(v)))
-                else:
-                    _add_name_token(str(v))
-        else:
-            for tok in re.findall(r"[A-Za-z.'\-]+(?:\s+[A-Za-z.'\-]+)?|\d{1,2}", str(val)):
-                _add_name_token(tok)
-
+        if k in row and row.get(k) is not None:
+            val = row.get(k)
+            if isinstance(val, list):
+                for v in val:
+                    # list may contain numbers or names
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        _add_name_token(str(int(v)))
+                    else:
+                        _add_name_token(str(v))
+            else:
+                # split any free text by commas/space
+                for tok in re.findall(r"[A-Za-z.'\-]+(?:\s+[A-Za-z.'\-]+)?|\d{1,2}", str(val)):
+                    _add_name_token(tok)
+    # clean out empties
     return {n for n in (out or set()) if n}
 
 def _gather_practice_absences(possession_rows: list[dict], date_start: str, date_end: str):
     """
     Group by normalized practice-date token and collect absent-name sets.
-    Returns (practices_sorted, abs_by_date).
+    Only date range is applied here (drill/defense filters do NOT affect PRAC).
+    Returns:
+      practices: list of date keys counted
+      abs_by_date: { date_key -> set(absent names) }
     """
     abs_by_date = {}
     dates = set()
 
     for r in (possession_rows or []):
+        # get the normalized practice date key
         dk = _row_practice_date_key(r)
         if not dk:
             continue
+
+        # apply ONLY date-range
         if not _passes_date_range({"practice_date": dk}, date_start, date_end):
             continue
+
         dates.add(dk)
         abset = abs_by_date.setdefault(dk, set())
         abset |= _extract_absent_names_from_row(r)
 
-    return sorted(dates), abs_by_date
+    practices = sorted(dates)
+    return practices, abs_by_date
 
 def _accumulate_practices(players: dict, possession_rows: list[dict], filters: dict):
     """
@@ -2828,8 +2914,11 @@ def _accumulate_practices(players: dict, possession_rows: list[dict], filters: d
     for dk in practices:
         absent = abs_by_date.get(dk, set())
         for full_name in all_players:
-            if full_name and full_name not in absent:
-                _ensure_player(players, full_name)["PRAC"] += 1
+            if not full_name:
+                continue
+            if full_name in absent:
+                continue
+            _ensure_player(players, full_name)["PRAC"] += 1
 # ------------------ END: Practice/absence helpers (PRAC) ----------------------
 
 
@@ -2838,8 +2927,9 @@ def compute_player_stats_table(possession_rows: list[dict], filters: dict) -> li
     """
     Build a table of per-player totals for the Stats tab.
     Columns:
-      Player, PTS, FGM,FGA,FG%, 2PM,2PA,2P%, 3PM,3PA,3P%, AST, SA,
-      DRB, ORB, TRB, LBTO, DBTO, TO, STL, DEF, BLK, OP, DP, PRAC
+      Player, PTS (NEW), FGM,FGA,FG%, 2PM,2PA,2P%, 3PM,3PA,3P%, AST, SA (NEW),
+      DRB, ORB, TRB, LBTO, DBTO, TO, STL, DEF, BLK, OP, DP
+      + PRAC (NEW)
     """
     players = {}
 
@@ -2847,14 +2937,12 @@ def compute_player_stats_table(possession_rows: list[dict], filters: dict) -> li
         if not row_passes_stats_filters(row, filters or {}):
             continue
 
-        # Prefer names-resolved PBP for participant harvesting
-        pbp = _row_pbp_for_parsing(row)
+        pbp = _row_possession_text(row)
+        # 🔑 FIX: read specials from the dedicated shorthand field
         shorthand = _row_shorthand_text(row)
-
-        # Role extraction for shot-related stats
         shot_x, shot_y = _row_xy(row)
         shot_res = _row_result(row)
-        shooter, ondef_disp, assister, screen_list, _ = _row_roles_and_lines(row)
+        shooter, ondef_disp, assister, _screen_list, _cand = _row_roles_and_lines(row)
 
         # Offensive / Defensive possessions from text + shorthand
         off_list, def_list = collect_players_from_possession(pbp, shorthand)
@@ -2871,26 +2959,36 @@ def compute_player_stats_table(possession_rows: list[dict], filters: dict) -> li
             if shot_res == "Make":
                 P["FGM"] += 1
                 if val == 2:
-                    P["2PM"] += 1; P["PTS"] += 2
+                    P["2PM"] += 1
+                    # NEW (mk10-PTS): add 2 points for made two
+                    P["PTS"] += 2
                 elif val == 3:
-                    P["3PM"] += 1; P["PTS"] += 3
-            if val == 2: P["2PA"] += 1
-            elif val == 3: P["3PA"] += 1
+                    P["3PM"] += 1
+                    # NEW (mk10-PTS): add 3 points for made three
+                    P["PTS"] += 3
+            if val == 2:
+                P["2PA"] += 1
+            elif val == 3:
+                P["3PA"] += 1
 
-        # Assists only on made FGs
+        # Assists (count only on made field goals to keep stat integrity)
         if assister and shooter and shot_res == "Make":
             _ensure_player(players, assister)["AST"] += 1
 
-        # Screen assists
-        for nm in (screen_list or []):
-            _ensure_player(players, nm)["SA"] += 1
+        # NEW (mk10-SA): Screen assists — increment for each screener parsed
+        screen_assisters = _screen_list or []
+        if screen_assisters:
+            for nm in screen_assisters:
+                _ensure_player(players, nm)["SA"] += 1
 
-        # Specials (rebounds, TOs, steals/blocks/deflections) — from shorthand
+        # Specials (rebounds, TOs, fouls, steals/blocks/deflections)
         sp = parse_special_stats_from_shorthand(shorthand)
+
         for nm in sp.get("def_rebounds", []):
             _ensure_player(players, nm)["DRB"] += 1
         for nm in sp.get("off_rebounds", []):
             _ensure_player(players, nm)["ORB"] += 1
+
         for nm in sp.get("live_ball_to", []):
             _ensure_player(players, nm)["LBTO"] += 1
         for nm in sp.get("dead_ball_to", []):
@@ -2902,24 +3000,24 @@ def compute_player_stats_table(possession_rows: list[dict], filters: dict) -> li
         for nm in sp.get("deflections", []):
             _ensure_player(players, nm)["DEF"] += 1
 
-    # Practices played (date-range only)
+    # --- NEW: accumulate practices played (PRAC) using date range only
     _accumulate_practices(players, possession_rows, filters)
 
-    # Derived fields
+    # Post-processing: compute derived fields (FG%, 2P%, 3P%, TRB, TO, F)
     table = []
-    for _, rec in players.items():
-        r = dict(rec)
-        r["FG%"] = _pct(r["FGM"], r["FGA"])
-        r["2P%"] = _pct(r["2PM"], r["2PA"])
-        r["3P%"] = _pct(r["3PM"], r["3PA"])
-        r["TRB"] = r["DRB"] + r["ORB"]
-        r["TO"]  = r["LBTO"] + r["DBTO"]
-        table.append(r)
+    for nm, rec in players.items():
+        rec = dict(rec)  # shallow copy
+        rec["FG%"] = _pct(rec["FGM"], rec["FGA"])
+        rec["2P%"] = _pct(rec["2PM"], rec["2PA"])
+        rec["3P%"] = _pct(rec["3PM"], rec["3PA"])
+        rec["TRB"] = rec["DRB"] + rec["ORB"]
+        rec["TO"]  = rec["LBTO"] + rec["DBTO"]
+        table.append(rec)
 
     return table
 
 
-# ------------ drawing helpers (court)
+# ------------ drawing helpers (unchanged visuals)
 def court_lines_traces():
     traces = []
     traces.append(go.Scatter(x=[0, COURT_W, COURT_W, 0, 0], y=[0, 0, HALF_H, HALF_H, 0],
@@ -3040,28 +3138,54 @@ def base_layout(fig_w=600, fig_h=720):
         plot_bgcolor="white",
         width=fig_w,
         height=fig_h,
-        margin=dict(l=10, r=10, t=0, b=0),
-        xaxis=dict(range=[0, COURT_W], showgrid=False, zeroline=False, ticks="", showticklabels=False, mirror=True, fixedrange=True),
-        yaxis=dict(range=[0, HALF_H], showgrid=False, zeroline=False, ticks="", showticklabels=False, scaleanchor="x", scaleratio=1, mirror=True, fixedrange=True),
+        margin=dict(l=10, r=10, t=0, b=0),   # no top margin
+        xaxis=dict(
+            range=[0, COURT_W],
+            showgrid=False,
+            zeroline=False,
+            ticks="",
+            showticklabels=False,
+            mirror=True,
+            fixedrange=True
+        ),
+        yaxis=dict(
+            range=[0, HALF_H],
+            showgrid=False,
+            zeroline=False,
+            ticks="",
+            showticklabels=False,
+            scaleanchor="x",
+            scaleratio=1,
+            mirror=True,
+            fixedrange=True
+        ),
         showlegend=False,
-        title=dict(text=None, pad=dict(t=0, b=0, l=0, r=0))
+        title=dict(text=None, pad=dict(t=0, b=0, l=0, r=0))  # 🔑 ensure no hidden title padding
     )
 
 
-# --- selection helpers
+# --- helper to apply fade styling and (optionally) clear any lingering selection
 def _apply_selection_styling(fig):
+    # When a point is selected, fade unselected points
     fig.update_traces(
         selected=dict(marker=dict(opacity=1.0)),
         unselected=dict(marker=dict(opacity=0.25))
     )
 
 def _clear_selectedpoints(fig):
+    """Force-clear any lingering selection so markers return to full color."""
     try:
         for tr in fig.data:
-            try: tr.pop("selectedpoints", None)
-            except Exception: pass
-            try: tr.selectedpoints = None
-            except Exception: pass
+            # both .pop (dict-like) and attribute set for GraphObjects safety
+            try:
+                tr.pop("selectedpoints", None)
+            except Exception:
+                pass
+            try:
+                tr.selectedpoints = None
+            except Exception:
+                pass
+        # also drop any highlight shapes we may have added earlier
         if "shapes" in fig.layout and fig.layout.shapes:
             fig.layout.shapes = tuple(s for s in fig.layout.shapes if getattr(s, "name", None) != "shot-highlight")
     except Exception:
@@ -3069,48 +3193,58 @@ def _clear_selectedpoints(fig):
 
 
 # ------------- Shot chart
-def create_shot_chart(shots_or_rows, highlight_coords=None):
+def create_shot_chart(shots, highlight_coords=None):
     fig = go.Figure()
     for tr in court_lines_traces(): 
         fig.add_trace(tr)
 
-    shots = rows_to_shots(shots_or_rows) if (shots_or_rows and (not isinstance(shots_or_rows, list) or (shots_or_rows and "row_ref" not in (shots_or_rows[0] or {})))) else (shots_or_rows or [])
+    # Ensure we are dealing with plottable shots, not raw rows
+    shots_list = rows_to_shots(shots) if shots and isinstance(shots[0], dict) and "row_ref" not in shots[0] else (shots or [])
 
-    makes = [(s["x"], s["y"]) for s in shots if s.get("result") == "Make"]
-    misses = [(s["x"], s["y"]) for s in shots if s.get("result") == "Miss"]
+    makes = [(s["x"], s["y"]) for s in shots_list if s["result"] == "Make"]
+    misses = [(s["x"], s["y"]) for s in shots_list if s["result"] == "Miss"]
 
     if makes:
         x, y = zip(*makes)
         fig.add_trace(go.Scatter(
             x=x, y=y, mode='markers',
             marker=dict(symbol='circle', size=10, color='green', line=dict(width=1, color='green')),
-            hovertemplate="Make<extra></extra>", name="Makes"
+            hovertemplate="Make<extra></extra>",
+            name="Makes"
         ))
     if misses:
         x, y = zip(*misses)
         fig.add_trace(go.Scatter(
             x=x, y=y, mode='markers',
             marker=dict(symbol='x', size=10, color='red'),
-            hovertemplate="Miss<extra></extra>", name="Misses"
+            hovertemplate="Miss<extra></extra>",
+            name="Misses"
         ))
 
+    # Selection/fade behavior
     _apply_selection_styling(fig)
 
+    # Optional highlight box around the focused shot
     if highlight_coords:
         L = 1.2
         for (hx, hy) in highlight_coords:
             fig.add_shape(
-                type="rect", x0=hx - L/2, y0=hy - L/2, x1=hx + L/2, y1=hy + L/2,
-                line=dict(color="#888", width=1), fillcolor="#e6e6e6",
-                layer="above", name="shot-highlight"
+                type="rect",
+                x0=hx - L/2, y0=hy - L/2, x1=hx + L/2, y1=hy + L/2,
+                line=dict(color="#888", width=1),
+                fillcolor="#e6e6e6",
+                layer="above",
+                name="shot-highlight"   # 🔑 tag so it can be removed later
             )
     else:
+        # 🔑 If we're *not* highlighting a shot (e.g., after Close),
+        # make sure no lingering selection keeps other points faded.
         _clear_selectedpoints(fig)
 
     fig.update_layout(**base_layout())
-    fig.update_layout(clickmode="event+select", uirevision="keep")
+    fig.update_layout(clickmode="event+select", uirevision="keep")  # keep pan/zoom but allow selection reset
 
-    # lane post lines (above markers)
+    # Little lane post lines (above markers)
     left_x  = RIM_X - FT_R
     right_x = RIM_X + FT_R
     for x in (left_x, right_x):
@@ -3120,8 +3254,10 @@ def create_shot_chart(shots_or_rows, highlight_coords=None):
 
 # --------- Zone-tiered color mapping by FG%
 def _zone_tier(zone_id: int) -> str:
-    if zone_id in (1, 2, 3, 4): return "close"
-    if zone_id in (5, 6, 7, 8, 9): return "mid"
+    if zone_id in (1, 2, 3, 4):
+        return "close"
+    if zone_id in (5, 6, 7, 8, 9):
+        return "mid"
     return "three"
 
 def _rgba_for_zone(zone_id: int, attempts: int, pct: float) -> str:
@@ -3145,22 +3281,10 @@ def _rgba_for_zone(zone_id: int, attempts: int, pct: float) -> str:
         return RED
 
 
-def create_zone_chart(shots_or_rows=None):
-    """
-    Build hot/cold zone chart.
-    - If shots_or_rows is None: load all data.
-    - If raw rows are passed, convert to shots.
-    - If shots are passed, use directly.
-    """
-    if shots_or_rows is None:
-        possession_rows = safe_load_data()
-        shots = rows_to_shots(possession_rows)
-    else:
-        # detect if we're handed raw rows (no 'row_ref')
-        if shots_or_rows and isinstance(shots_or_rows, list) and shots_or_rows and "row_ref" not in (shots_or_rows[0] or {}):
-            shots = rows_to_shots(shots_or_rows)
-        else:
-            shots = shots_or_rows or []
+def create_zone_chart():
+    # Load raw rows, convert to shots so result/x/y are guaranteed
+    possession_rows = safe_load_data()
+    shots = rows_to_shots(possession_rows)
 
     fig = go.Figure()
 
@@ -3196,19 +3320,22 @@ def create_zone_chart(shots_or_rows=None):
 
 
 # =========================
-# Dash App (core objects)
+# Dash App
 # =========================
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 
-_initial_rows = safe_load_data()
-_initial_shot_fig = create_shot_chart(_initial_rows)
-_initial_zone_fig = create_zone_chart(_initial_rows)
+_initial_shots = safe_load_data()
+_initial_shot_fig = create_shot_chart(_initial_shots)
+_initial_zone_fig = create_zone_chart()
 
-# ---- DataTable for sortable Stats tab
-from dash import dash_table
+# ---- mk5 ADD: bring in DataTable for sortable Stats tab
+from dash import dash_table  # (Dash 2+) correct import
+
+# ====================== mk5: helpers used by callbacks (moved here so Section 4 sees them) =================
 
 
-# ====================== Basic & Advanced table schemas/helpers ======================
+# ====================== NEW (mk9-adv): Basic & Advanced table schemas/helpers ======================
+# NOTE: We are *moving* OP and DP off the primary (basic) table into the Advanced table.
 
 # Keep a stable id for the original (basic) table if not already defined elsewhere.
 if 'BASIC_STATS_TABLE_ID' not in globals():
@@ -3217,7 +3344,8 @@ if 'BASIC_STATS_TABLE_ID' not in globals():
 # Canonical basic-table columns (OP/DP intentionally omitted).
 BASIC_STATS_COLUMNS = [
     {"key": "Player", "name": "Player"},
-    {"key": "PTS", "name": "PTS"},             # NEW (mk10-PTS)
+    # NEW (mk10-PTS): insert Points immediately after Player
+    {"key": "PTS", "name": "PTS"},
     {"key": "FGM", "name": "FGM"},
     {"key": "FGA", "name": "FGA"},
     {"key": "FG%", "name": "FG%"},
@@ -3228,7 +3356,8 @@ BASIC_STATS_COLUMNS = [
     {"key": "3PA", "name": "3PA"},
     {"key": "3P%", "name": "3P%"},
     {"key": "AST", "name": "AST"},
-    {"key": "SA", "name": "SA"},               # NEW (mk10-SA)
+    # NEW (mk10-SA): insert Screen Assists between AST and DRB
+    {"key": "SA", "name": "SA"},
     {"key": "DRB", "name": "DRB"},
     {"key": "ORB", "name": "ORB"},
     {"key": "TRB", "name": "TRB"},
@@ -3256,12 +3385,14 @@ def get_advanced_stats_columns():
         {"key": "OP", "name": "OP"},
         {"key": "DP", "name": "DP"},
     ])
+    # Extend (avoid dupes if caller already added)
     extra = [
         {"key":"eFG%", "name":"eFG%"},
         {"key":"PPS",  "name":"PPS"},
         {"key":"AST%", "name":"AST%"},
         {"key":"TOV%", "name":"TOV%"},
         {"key":"AST/TO","name":"AST/TO"},
+        # --- NEW (mk12-rtg): ratings
         {"key":"ORtg", "name":"ORtg"},
         {"key":"DRtg", "name":"DRtg"},
         {"key":"NET",  "name":"NET"},
@@ -3271,8 +3402,14 @@ def get_advanced_stats_columns():
     cols = list(base) + [c for c in extra if c["key"] not in keys]
     return [{"id": c["key"], "name": c["name"]} for c in cols]
 
-# ---- Advanced row shaping (with metrics)
+# ---- NEW (mk11/12-advstats): build extended advanced row locally if needed ----------
 def _build_advanced_row_extended(player_record: dict) -> dict:
+    """
+    Construct an Advanced-table row including OP, DP, derived shooting metrics,
+    and the rating metrics (ORtg, DRtg, NET, +/-).
+    Assumes compute_adv_metrics_for_row(...) and compute_ratings_for_row(...) have
+    already populated the metrics when available.
+    """
     rec = {
         "Player": player_record.get("Player", ""),
         "OP": player_record.get("OP", 0),
@@ -3282,6 +3419,7 @@ def _build_advanced_row_extended(player_record: dict) -> dict:
         "AST%": round(float(player_record.get("AST%", 0.0)), 1),
         "TOV%": round(float(player_record.get("TOV%", 0.0)), 1),
         "AST/TO": round(float(player_record.get("AST/TO", 0.0)), 2),
+        # Ratings (round to 1 decimal for readability)
         "ORtg": round(float(player_record.get("ORtg", 0.0)), 1),
         "DRtg": round(float(player_record.get("DRtg", 0.0)), 1),
         "NET":  round(float(player_record.get("NET", 0.0)), 1),
@@ -3291,19 +3429,23 @@ def _build_advanced_row_extended(player_record: dict) -> dict:
 
 def split_basic_and_advanced_rows(full_rows: list[dict]):
     """
-    Produce:
+    Take aggregated per-player rows (which include OP/DP) and produce:
       - basic_rows_no_adv: rows with OP/DP removed
       - advanced_rows: rows shaped for the Advanced table with metrics
+    Prefers Section 2 helpers if present.
     """
-    rows = list(full_rows or [])
+    rows = full_rows or []
 
+    # 1) Compute advanced shooting metrics and ratings onto each player row if helpers exist.
     if 'compute_adv_metrics_for_rows' in globals():
-        rows = compute_adv_metrics_for_rows(rows)
+        rows = compute_adv_metrics_for_rows(list(rows))  # mutate-safe
     if 'compute_ratings_for_rows' in globals():
         rows = compute_ratings_for_rows(rows)
 
+    # 2) If a convenience wrapper exists, use it (handles basic/advanced split).
     if 'project_advanced_with_all_metrics' in globals():
         basic, adv = project_advanced_with_all_metrics(rows)
+        # ensure ratings present; rebuild if wrapper didn't include them
         if adv and "ORtg" not in adv[0]:
             adv = [_build_advanced_row_extended(r) for r in rows]
         return basic, adv
@@ -3313,32 +3455,40 @@ def split_basic_and_advanced_rows(full_rows: list[dict]):
             adv = [_build_advanced_row_extended(r) for r in rows]
         return basic, adv
 
-    basic, adv = [], []
-    for r in rows:
-        rr = dict(r); rr.pop("OP", None); rr.pop("DP", None)
+    # 3) Fallback path: do split here, building advanced rows with metrics.
+    basic = []
+    adv = []
+    for r in (rows or []):
+        rr = dict(r)
+        rr.pop("OP", None)
+        rr.pop("DP", None)
         basic.append(rr)
         adv.append(_build_advanced_row_extended(r))
     return basic, adv
+# ==================== END (mk9-adv): Basic & Advanced table schemas/helpers ======================
 
 
-# -------- Ratings pipeline (PF/PA + ratings -> tables)
+# -------- NEW (mk12-rtg): one-stop helper to compute both tables with PF/PA + Ratings ----------
 def compute_tables_with_ratings(possession_rows: list[dict], filters: dict) -> tuple[list[dict], list[dict]]:
     """
     1) Aggregate per-player (compute_player_stats_table)
-    2) Apply PF/PA & compute ORtg/DRtg/NET/+/- if helpers exist
+    2) Apply PF/PA from possessions and compute ORtg/DRtg/NET/+/- if helpers exist
     3) Split into (basic_rows, advanced_rows)
     """
     rows = compute_player_stats_table(possession_rows, filters)
 
+    # Award PF/PA and compute ratings if the helpers are available (from Sections 2–3)
     if 'apply_pf_pa_and_ratings_to_player_rows' in globals():
         apply_pf_pa_and_ratings_to_player_rows(rows, possession_rows, filters)
     elif 'compute_ratings_for_rows' in globals():
         compute_ratings_for_rows(rows)
 
     return split_basic_and_advanced_rows(rows)
+# -------------------------------------------------------------------------------------------------
 
 
-# Ensure initial figures preserve UI state
+
+# Ensure initial figures preserve UI state (no flicker)
 try:
     _initial_shot_fig.update_layout(uirevision="keep")
     _initial_zone_fig.update_layout(uirevision="keep")
@@ -3347,6 +3497,10 @@ except Exception:
 
 # ---------- Legend component (colors only; labels filled later in Section 5) ----------
 def zone_legend_component():
+    """
+    Visual key placed under the Hot/Cold Zones chart.
+    Shows % ranges for each color; the text is filled by callbacks in Section 5.
+    """
     BLUE   = "rgba(0,102,204,0.95)"
     YELLOW = "rgba(255,204,0,0.95)"
     RED    = "rgba(204,0,0,0.95)"
@@ -3362,6 +3516,7 @@ def zone_legend_component():
     }
 
     def tier_row(span_id_blue, span_id_yellow, span_id_red):
+        # three colored bins + labels (labels are injected via callbacks)
         return html.Div(
             [
                 html.Span(style={**BOX, "background": BLUE}),
@@ -3409,6 +3564,7 @@ def zone_legend_component():
 
 
 
+
 #-----------------------------------------Section 5--------------------------------------------------------------
 #
 # Robust, lazy layout builder that never returns None (prevents blank screen on Render)
@@ -3429,7 +3585,7 @@ def _safe_fig(default_title=""):
             fig.update_layout(title=default_title, margin=dict(l=10, r=10, t=30, b=10))
         return fig
     except Exception:
-        # Absolute fallback
+        # Absolute fallback (shouldn't happen on Render)
         return None
 
 def _safe_component(component, fallback):
@@ -3438,34 +3594,12 @@ def _safe_component(component, fallback):
     except Exception:
         return fallback
 
-# ---------- tiny fallbacks so this section never explodes ----------
-if '_split_fullname_list' not in globals():
-    def _split_fullname_list(s: str) -> list[str]:
-        s = (s or "").strip()
-        if not s: return []
-        parts = re.split(r"\s*,\s*|\s+and\s+", s)
-        return [p for p in (parts or []) if p]
-
-if '_strip_leading_preps' not in globals():
-    def _strip_leading_preps(s: str) -> str:
-        return re.sub(r"^(?:for|to|by|on|at|from|with|over|against|vs\.?|into|out of|off)\s+", "", (s or ""), flags=re.IGNORECASE)
-
-if '_trim_trailing_verb' not in globals():
-    def _trim_trailing_verb(s: str) -> str:
-        return re.sub(r"\s+(?:dribbles|drives|passes|screens|rebounds?|boards?|steals?|blocks?|fouls?|turnover|travels?|shoots?|cuts?|rolls?|slips?|hands?|handoff|posts?|sets?|receives?|catches?|tips?)\s*$", "", (s or ""), flags=re.IGNORECASE)
-
 # ---------------- roster harvesting & normalization ----------------
 def _harvest_fullnames_from_any(value):
     out = []
     if isinstance(value, str):
-        # fall back to simple Name Name heuristic if _FULLNAME isn't defined
-        patt = globals().get("_FULLNAME")
-        if patt:
-            if " " in value and re.match(rf"^{patt}$", value.strip()):
-                out.append(value.strip())
-        else:
-            if re.match(r"^[A-Z][a-zA-Z'.\-]+\s+[A-Z][a-zA-Z'.\-]+$", value.strip()):
-                out.append(value.strip())
+        if " " in value and re.match(rf"^{_FULLNAME}$", value.strip()):
+            out.append(value.strip())
     elif isinstance(value, list):
         for v in value:
             out += _harvest_fullnames_from_any(v)
@@ -3501,7 +3635,7 @@ def _collect_roster_for_group(rows_for_plot, key):
         pass
 
     # Last resort: scrape names out of matching group's fields
-    for rr in rows_for_plot or []:
+    for rr in rows_for_plot:
         k = rr.get("group_id") or rr.get("timestamp") or rr.get("id")
         if k != key:
             continue
@@ -3519,7 +3653,7 @@ def _collect_roster_for_group(rows_for_plot, key):
 
     # Pool all values in the group
     pool = []
-    for rr in rows_for_plot or []:
+    for rr in rows_for_plot:
         k = rr.get("group_id") or rr.get("timestamp") or rr.get("id")
         if k != key:
             continue
@@ -3532,33 +3666,48 @@ def _collect_roster_for_group(rows_for_plot, key):
             ordered.append(n); seen.add(low)
     return ordered
 
-# --- Avoid clobbering Section-1’s _normalize_to_roster ---
+# --- RENAMED to avoid clobbering Section-1's _normalize_to_roster ---
 def _normalize_to_roster_for_list(name, roster_full_list):
     nm = _trim_trailing_verb(name or "").strip()
     nm = _strip_leading_preps(nm)
-    nm = re.sub(r"(?:\s*(?:,|and|&)\s*)+$", "", nm, flags=re.IGNORECASE)
+    nm = re.sub(r"(?:\s*(?:,|and|&)\s*)+$", "", nm, flags=re.IGNORECASE)  # strip dangling connectors
     if not nm:
         return nm
-    # Prefer strict canon if available
-    if '_strict_canon_name' in globals():
-        return _strict_canon_name(nm)
-    # Fallback: try last-name unique match
     roster_dict = {str(i): full for i, full in enumerate(roster_full_list or [], 1)}
+    last_map, first_map, full_set = _build_name_maps(roster_dict)
+
     low = nm.lower()
     if " " not in nm:
-        cands = [full for full in roster_dict.values() if low in full.lower()]
-        return cands[0] if len(cands) == 1 else nm
-    for full in roster_dict.values():
-        if full.strip().lower() == low:
-            return full
-    return nm
+        if low in last_map and len(last_map[low]) == 1:
+            return last_map[low][0]
+        if low in first_map and len(first_map[low]) == 1:
+            return first_map[low][0]
+        subs = [full for full in roster_dict.values() if low in full.lower()]
+        if len(subs) == 1:
+            return subs[0]
+        return nm
+    else:
+        if low in full_set:
+            for full in roster_dict.values():
+                if full.strip().lower() == low:
+                    return full
+        parts = nm.split()
+        first_tok, last_tok = parts[0].lower(), parts[-1].lower()
+        cands = []
+        for full in roster_dict.values():
+            fparts = full.lower().split()
+            if fparts and fparts[0].startswith(first_tok) and fparts[-1] == last_tok:
+                cands.append(full)
+        if len(cands) == 1:
+            return cands[0]
+        return nm
 
 def _norm_block(value, roster_full_list):
     return _normalize_to_roster_for_list(value, roster_full_list)
 
 # ---------- helper: patch "Bring over halfcourt" using 'X picks up Y' if needed
-_BRING_SUBJ_RE = re.compile(rf"({globals().get('_FULLNAME','[A-Za-z].+?')})\s+bring[s]?\s+(?:the\s+ball\s+)?over\s+half\s*court", re.IGNORECASE)
-_PICKS_UP_RE   = re.compile(rf"({globals().get('_FULLNAME','[A-Za-z].+?')})\s+picks\s+up\s+({globals().get('_FULLNAME','[A-Za-z].+?')})", re.IGNORECASE)
+_BRING_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+bring[s]?\s+(?:the\s+ball\s+)?over\s+half\s*court", re.IGNORECASE)
+_PICKS_UP_RE   = re.compile(rf"({_FULLNAME})\s+picks\s+up\s+({_FULLNAME})", re.IGNORECASE)
 
 def _patch_bring_over_halfcourt(actions, pbp_text):
     """Fill bh/bh_def for 'Bring over halfcourt' when PBP uses 'X picks up Y'."""
@@ -3603,14 +3752,7 @@ _HELP_VERBS_RE    = re.compile(r"\bhelp(?:s|ed|ing)?\b|\bsteps\s+in\s+to\s+help\
 def shot_defender_display(pbp_text: str, shot_index: int) -> str:
     """Format defenders for the Nth shot line, preserving 'rotating over' tags."""
     line = _nth_shot_line(pbp_text or "", shot_index)
-    if '_parse_defenders_with_tags_from_line' in globals() and '_format_defenders_for_display' in globals():
-        return _format_defenders_for_display(_parse_defenders_with_tags_from_line(line))
-    # fallback: return defenders_display from role extractor
-    try:
-        _, defenders_disp, _, _, _ = extract_roles_for_shot(pbp_text or "", shot_index)
-        return defenders_disp
-    except Exception:
-        return ""
+    return _format_defenders_for_display(_parse_defenders_with_tags_from_line(line))
 
 def shot_has_help(pbp_text: str, shot_index: int) -> bool:
     """True if possession text/shot line contains help cues."""
@@ -3691,117 +3833,113 @@ def participants_for_possession(pbp_text: str, shorthand_text: str):
     except Exception:
         return ([], [])
 
-# ------------------------- OFF-BALL actions + coverages (only if not already defined) -------------------------
-if '_OFFBALL_TYPES' not in globals():
-    _OFFBALL_TYPES = {
-        "bd":  {"label": "Backdoor cut", "keys": [r"\bbackdoor\b", r"backdoor\s+cut"]},
-        "pn":  {"label": "Pin down", "keys": [r"\bpin\s*down\b", r"\bpindown\b"]},
-        "fl":  {"label": "Flare screen", "keys": [r"\bflare\s+screen\b"]},
-        "bk":  {"label": "Back screen", "keys": [r"\bback\s+screen\b"]},
-        "awy": {"label": "Away screen", "keys": [r"\baway\s+screen\b"]},
-        "hm":  {"label": "Hammer screen", "keys": [r"\bhammer\s+screen\b"]},
-        "ucla":{"label": "UCLA screen", "keys": [r"\bucla\s+screen\b"]},
-        "crs": {"label": "Cross screen", "keys": [r"\bcross\s+screen\b"]},
-        "wdg": {"label": "Wedge screen", "keys": [r"\bwedge\s+screen\b"]},
-        "rip": {"label": "Rip screen", "keys": [r"\brip\s+screen\b"]},
-        "stg": {"label": "Stagger screen", "keys": [r"\bstagger\s+screen[s]?\b"]},
-        "ivs": {"label": "Iverson screen", "keys": [r"\biverson\s+screen[s]?\b"]},
-        "elv": {"label": "Elevator screen", "keys": [r"\belevator\s+screen[s]?\b"]},
-    }
+# ------------------------- OFF-BALL actions + coverages (mk5 version with stagger merge) -------------------------
+_OFFBALL_TYPES = {
+    "bd":  {"label": "Backdoor cut", "keys": [r"\bbackdoor\b", r"backdoor\s+cut"]},
+    "pn":  {"label": "Pin down", "keys": [r"\bpin\s*down\b", r"\bpindown\b"]},
+    "fl":  {"label": "Flare screen", "keys": [r"\bflare\s+screen\b"]},
+    "bk":  {"label": "Back screen", "keys": [r"\bback\s+screen\b"]},
+    "awy": {"label": "Away screen", "keys": [r"\baway\s+screen\b"]},
+    "hm":  {"label": "Hammer screen", "keys": [r"\bhammer\s+screen\b"]},
+    "ucla":{"label": "UCLA screen", "keys": [r"\bucla\s+screen\b"]},
+    "crs": {"label": "Cross screen", "keys": [r"\bcross\s+screen\b"]},
+    "wdg": {"label": "Wedge screen", "keys": [r"\bwedge\s+screen\b"]},
+    "rip": {"label": "Rip screen", "keys": [r"\brip\s+screen\b"]},
+    "stg": {"label": "Stagger screen", "keys": [r"\bstagger\s+screen[s]?\b"]},
+    "ivs": {"label": "Iverson screen", "keys": [r"\biverson\s+screen[s]?\b"]},
+    "elv": {"label": "Elevator screen", "keys": [r"\belevator\s+screen[s]?\b"]},
+}
 
-if '_matches_any' not in globals():
-    def _matches_any(text_lc: str, patt_list):
-        for p in patt_list:
-            if re.search(p, text_lc, re.IGNORECASE):
-                return True
-        return False
+def _matches_any(text_lc: str, patt_list):
+    for p in patt_list:
+        if re.search(p, text_lc, re.IGNORECASE):
+            return True
+    return False
 
-if '_parse_guarded_pairs_in_order' not in globals():
-    def _parse_guarded_pairs_in_order(text: str):
-        out = []
-        for m in re.finditer(_SHOOT_GUARD_RE, _clean_frag(text)):
-            a = _trim_trailing_verb(m.group(1).strip())
-            b = _trim_trailing_verb(m.group(2).strip())
-            a = _strip_leading_preps(a)
-            b = _strip_leading_preps(b)
-            out.append((a, b))
-        return out
+def _parse_guarded_pairs_in_order(text: str):
+    out = []
+    for m in re.finditer(_SHOOT_GUARD_RE, _clean_frag(text)):
+        a = _trim_trailing_verb(m.group(1).strip())
+        b = _trim_trailing_verb(m.group(2).strip())
+        a = _strip_leading_preps(a)
+        b = _strip_leading_preps(b)
+        out.append((a, b))
+    return out
 
-if 'parse_offball_actions_from_pbp' not in globals():
-    def parse_offball_actions_from_pbp(lines):
-        stg_agg = None
-        stg_seen_scr = set()
-        stg_seen_cov = set()
-        stg_connected = False
-        actions = []
+def parse_offball_actions_from_pbp(lines):
+    stg_agg = None
+    stg_seen_scr = set()
+    stg_seen_cov = set()
+    stg_connected = False
+    actions = []
 
-        for ln in (lines or []):
-            lc = ln.lower()
-            matched_key = None
-            for k, meta in _OFFBALL_TYPES.items():
-                if _matches_any(lc, meta["keys"]):
-                    matched_key = k
-                    break
-            if not matched_key:
-                continue
+    for ln in (lines or []):
+        lc = ln.lower()
+        matched_key = None
+        for k, meta in _OFFBALL_TYPES.items():
+            if _matches_any(lc, meta["keys"]):
+                matched_key = k
+                break
+        if not matched_key:
+            continue
 
-            pairs = _parse_guarded_pairs_in_order(ln)
-            coming_off, coming_off_def = ("","")
-            screeners = []
-            if pairs:
-                coming_off, coming_off_def = pairs[0]
-                for a, b in pairs[1:]:
-                    screeners.append({"name": a, "def": b})
+        pairs = _parse_guarded_pairs_in_order(ln)
+        coming_off, coming_off_def = ("","")
+        screeners = []
+        if pairs:
+            coming_off, coming_off_def = pairs[0]
+            for a, b in pairs[1:]:
+                screeners.append({"name": a, "def": b})
 
-            covs = _parse_coverages(ln) if '_parse_coverages' in globals() else []
-            is_shot_line = _is_shot_line(ln) if '_is_shot_line' in globals() else False
+        covs = _parse_coverages(ln)
+        is_shot_line = _is_shot_line(ln)
 
-            if matched_key == "stg":
-                if stg_agg is None:
-                    stg_agg = {
-                        "type": "stg",
-                        "label": _OFFBALL_TYPES["stg"]["label"],
-                        "coming_off": coming_off,
-                        "coming_off_def": coming_off_def,
-                        "screeners": [],
-                        "coverages": [],
-                        "connected_to_shot": False,
-                    }
-                if not stg_agg.get("coming_off") and coming_off:
-                    stg_agg["coming_off"] = coming_off
-                if not stg_agg.get("coming_off_def") and coming_off_def:
-                    stg_agg["coming_off_def"] = coming_off_def
+        if matched_key == "stg":
+            if stg_agg is None:
+                stg_agg = {
+                    "type": "stg",
+                    "label": _OFFBALL_TYPES["stg"]["label"],
+                    "coming_off": coming_off,
+                    "coming_off_def": coming_off_def,
+                    "screeners": [],
+                    "coverages": [],
+                    "connected_to_shot": False,
+                }
+            if not stg_agg.get("coming_off") and coming_off:
+                stg_agg["coming_off"] = coming_off
+            if not stg_agg.get("coming_off_def") and coming_off_def:
+                stg_agg["coming_off_def"] = coming_off_def
 
-                for s in screeners:
-                    key = (s.get("name","").lower(), s.get("def","").lower())
-                    if key not in stg_seen_scr and (s.get("name") or s.get("def")):
-                        stg_agg["screeners"].append({"name": s.get("name",""), "def": s.get("def","")})
-                        stg_seen_scr.add(key)
+            for s in screeners:
+                key = (s.get("name","").lower(), s.get("def","").lower())
+                if key not in stg_seen_scr and (s.get("name") or s.get("def")):
+                    stg_agg["screeners"].append({"name": s.get("name",""), "def": s.get("def","")})
+                    stg_seen_scr.add(key)
 
-                for c in (covs or []):
-                    key = (c.get("label","").lower(), (c.get("onto","") or "").lower())
-                    if key not in stg_seen_cov:
-                        stg_agg["coverages"].append(c)
-                        stg_seen_cov.add(key)
+            for c in (covs or []):
+                key = (c.get("label","").lower(), (c.get("onto","") or "").lower())
+                if key not in stg_seen_cov:
+                    stg_agg["coverages"].append(c)
+                    stg_seen_cov.add(key)
 
-                if is_shot_line:
-                    stg_connected = True
-                continue
+            if is_shot_line:
+                stg_connected = True
+            continue
 
-            actions.append({
-                "type": matched_key,
-                "label": _OFFBALL_TYPES[matched_key]["label"],
-                "coming_off": coming_off,
-                "coming_off_def": coming_off_def,
-                "screeners": screeners,
-                "coverages": covs,
-                "connected_to_shot": bool(is_shot_line),
-            })
+        actions.append({
+            "type": matched_key,
+            "label": _OFFBALL_TYPES[matched_key]["label"],
+            "coming_off": coming_off,
+            "coming_off_def": coming_off_def,
+            "screeners": screeners,
+            "coverages": covs,
+            "connected_to_shot": bool(is_shot_line),
+        })
 
-        if stg_agg:
-            stg_agg["connected_to_shot"] = bool(stg_connected)
-            actions.append(stg_agg)
-        return actions
+    if stg_agg:
+        stg_agg["connected_to_shot"] = bool(stg_connected)
+        actions.append(stg_agg)
+    return actions
 
 # ================== defender-rotation decoration across ANY possession line ==================
 def _last_token(n: str) -> str:
@@ -3941,10 +4079,8 @@ def serve_layout():
     # Pull (or default) figures/components so missing globals do not break layout
     shot_fig = _g("_initial_shot_fig", _safe_fig("Shot Chart"))
     zone_fig = _g("_initial_zone_fig", _safe_fig("Hot/Cold Zones"))
-    zone_legend_comp = _g("zone_legend_component")
-    zone_legend = _safe_component(zone_legend_comp, lambda: html.Div())()
+    zone_legend = _safe_component(_g("zone_legend_component"), lambda: html.Div())()
     bs_table_id = (BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table")
-    adv_table_id = (ADVANCED_STATS_TABLE_ID if 'ADVANCED_STATS_TABLE_ID' in globals() else "advanced_stats_table")
 
     return html.Div(
         style={"maxWidth":"1600px","margin":"0 auto","padding":"10px"},
@@ -4111,7 +4247,7 @@ def serve_layout():
                             "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
                         }),
                         dash_table.DataTable(
-                            id=adv_table_id,
+                            id="advanced_stats_table",
                             columns=adv_cols,
                             data=[],
                             sort_action="native",
@@ -4145,27 +4281,20 @@ def serve_layout():
         ]
     )
 
-# Have Dash use the lazy layout builder
-app.layout = serve_layout
-
 
 
 
 #-------------------------------------Section 6---------------------------------------
 
+
+
+
+
+
 # Crash-proof layout assignment (prevents _dash-layout = null on first hit)
 
-import sys, traceback, re, os, json, math, copy
-from uuid import uuid4
-from datetime import datetime, date
-from collections import defaultdict
-
-import plotly.graph_objects as go
-from dash import html, dcc, callback, Output, Input, State, no_update
-
-# Resolve table IDs exactly like Section 5 used them
-BASIC_TBL_ID = globals().get("BASIC_STATS_TABLE_ID", "stats-table")
-ADV_TBL_ID   = globals().get("ADVANCED_STATS_TABLE_ID", "advanced_stats_table")
+import sys, traceback
+from dash import html, dcc
 
 def _fallback_layout(message: str = ""):
     """Minimal layout so Dash never returns null; message shows in Render logs."""
@@ -4188,8 +4317,10 @@ def _safe_serve_layout():
     try:
         if callable(serve_layout):
             return serve_layout()
+        # If for some reason serve_layout isn't callable, don't crash.
         return _fallback_layout("serve_layout is not callable at import time.")
     except Exception:
+        # Log full traceback to stderr so it appears in Render logs.
         print("[serve_layout] exception:", file=sys.stderr)
         print(traceback.format_exc(), file=sys.stderr)
         return _fallback_layout("Exception raised while building layout.")
@@ -4198,7 +4329,16 @@ def _safe_serve_layout():
 app.layout = _safe_serve_layout
 
 
-# ====================== small safe helpers ======================
+
+# ---------------- callbacks ----------------
+from datetime import datetime, date
+from collections import defaultdict
+from dash import callback, Output, Input, State, no_update
+from uuid import uuid4
+import re, os, json, math, copy
+
+
+
 
 def _parse_date_any(s):
     if not s: return None
@@ -4210,6 +4350,13 @@ def _parse_date_any(s):
     except:
         return None
 
+_DRILL_SIZE_RE = re.compile(r"\b(\d+v\d+)\b", re.IGNORECASE)
+
+def _get_drill_size(drill: str) -> str:
+    if not drill: return ""
+    m = _DRILL_SIZE_RE.search(drill)
+    return (m.group(1) if m else "").lower()
+
 def _distance_from_rim(x,y):
     try:
         return math.hypot(float(x) - RIM_X, float(y) - RIM_Y)
@@ -4219,43 +4366,36 @@ def _distance_from_rim(x,y):
 def _is_three(x,y):
     return _distance_from_rim(x,y) >= THREE_R - 1e-9
 
-_name_token_re = re.compile(r"[A-Za-z']+")
 
-def _maybe_normalize_to_roster(s: str) -> str:
-    fn = globals().get("_normalize_to_roster")
-    if not fn: return ""
-    try: return fn(s)
-    except: return ""
+# ===== Strict roster name cleaning (uses Section 2 canonicalizer) =====
+_name_token_re = re.compile(r"[A-Za-z']+")
 
 # Never let a name collapse to "" — fall back to the raw string so stats aggregate.
 def _force_to_roster_name(piece: str) -> str:
     s = (piece or "").strip()
     if not s:
         return ""
-    nm = ""
-    if "_strict_canon_name" in globals():
-        try:
-            nm = _strict_canon_name(s)
-        except Exception:
-            nm = ""
+    # strict match (e.g., full name already in roster map)
+    nm = _strict_canon_name(s)
     if nm:
         return nm
-
-    nm = _maybe_normalize_to_roster(s)
+    # loose match on full string
+    nm = _normalize_to_roster(s)
     if nm and " " in nm:
         return nm
-
+    # try adjacent tokens as "First Last"
     toks = _name_token_re.findall(s)
     for i in range(len(toks) - 1):
         cand = f"{toks[i]} {toks[i+1]}"
-        nm = _maybe_normalize_to_roster(cand)
+        nm = _normalize_to_roster(cand)
         if nm and " " in nm:
             return nm
+    # last-ditch: single tokens reversed (last name first)
     for t in reversed(toks):
-        nm = _maybe_normalize_to_roster(t)
+        nm = _normalize_to_roster(t)
         if nm and " " in nm:
             return nm
-
+    # ▼ critical change: use the raw string instead of "" so stats don’t vanish
     return s
 
 def _clean_name_list_to_roster(lst) -> list[str]:
@@ -4266,124 +4406,208 @@ def _clean_name_list_to_roster(lst) -> list[str]:
             seen.add(nm.lower()); out.append(nm)
     return out
 
-def _uniq_sorted(seq):
-    seen = set(); out = []
-    for s in (seq or []):
-        if not s: continue
-        key = str(s).strip(); l = key.lower()
-        if l and l not in seen:
-            seen.add(l); out.append(key)
-    return sorted(out, key=lambda z: z.lower())
 
-def _split_fullname_list_fallback(s: str) -> list[str]:
-    s = (s or "").strip()
-    if not s: return []
-    parts = re.split(r"\s*,\s*|\s+and\s+", s)
-    return [p for p in (parts or []) if p]
+# ====== On-ball (connected-to-shot) ======
+_ONBALL_FINISH_CODES = {c.lower() for c in ONBALL_ACTION_CODES}
 
-def _split_names(s_or_list):
-    if not s_or_list: return []
-    if isinstance(s_or_list, list):
-        raw = []
-        for v in s_or_list:
-            raw += _split_names(v)
-        return _uniq_sorted(raw)
-    if '_split_fullname_list' in globals():
-        try:
-            return _split_fullname_list(str(s_or_list))
-        except Exception:
-            return _split_fullname_list_fallback(str(s_or_list))
-    return _split_fullname_list_fallback(str(s_or_list))
+def _onball_codes_connected_to_shot(short_text: str) -> set[str]:
+    out = set()
+    if not short_text: return out
+    toks = [t for t in re.split(r"\s+", short_text.strip()) if t]
+    if not toks: return out
+
+    finish_idx = None
+    for i, tok in enumerate(toks):
+        tl = tok.lower()
+        if "+" in tl or "-" in tl:
+            finish_idx = i
+            break
+
+    scan_range = range(len(toks)) if finish_idx is None else range(0, finish_idx + 1)
+    for i in scan_range:
+        tl = toks[i].lower()
+        for code in _ONBALL_FINISH_CODES:
+            if code and code in tl:
+                out.add(code)
+    return out
+
+_ONBALL_ALIAS_MAP = {
+    "pnp": {"pnp", "pick and pop", "pick & pop"},
+    "pnr": {"pnr", "pick and roll", "pick & roll"},
+    "dho": {"dho", "dribble handoff"},
+    "ho":  {"ho", "handoff"},
+    "slp": {"slp", "slip"},
+    "gst": {"gst", "ghost"},
+    "kp":  {"kp", "keep"},
+    "rj":  {"rj", "reject"},
+    "p":   {"p", "post up", "post-up"},
+    "rs":  {"rs", "re-screen", "rescreen"},
+}
+def _expand_onball_aliases(codes: set[str]) -> set[str]:
+    out = set()
+    for c in (codes or set()):
+        c = (c or "").lower()
+        if not c: continue
+        if c in _ONBALL_ALIAS_MAP:
+            out |= {s.lower() for s in _ONBALL_ALIAS_MAP[c]}
+        else:
+            out.add(c)
+    return out
 
 
-# ====================== data access (safe) ======================
+# ====== Off-ball (connected-to-shot) ======
+_OFFBALL_CODES = {
+    "bd", "pn", "fl", "awy", "hm", "crs", "wdg", "rip", "ucla", "stg", "ivs", "elv"
+}
+_OFFBALL_ALIAS_MAP = {
+    "bd":   {"bd", "backdoor", "backdoor cut"},
+    "pn":   {"pn", "pin down", "pindown"},
+    "fl":   {"fl", "flare", "flare screen"},
+    "awy":  {"awy", "away", "away screen"},
+    "hm":   {"hm", "hammer", "hammer screen"},
+    "crs":  {"crs", "cross", "cross screen"},
+    "wdg":  {"wdg", "wedge", "wedge screen"},
+    "rip":  {"rip", "rip screen"},
+    "ucla": {"ucla", "ucla screen"},
+    "stg":  {"stg", "stagger", "stagger screen", "stagger screens"},
+    "ivs":  {"ivs", "iverson", "iverson screen", "iverson screens"},
+    "elv":  {"elv", "elevator", "elevator screen", "elevator screens"},
+}
+def _expand_offball_aliases(codes: set[str]) -> set[str]:
+    out = set()
+    for c in (codes or set()):
+        c = (c or "").lower()
+        if not c: continue
+        if c in _OFFBALL_ALIAS_MAP:
+            out |= {s.lower() for s in _OFFBALL_ALIAS_MAP[c]}
+        else:
+            out.add(c)
+    return out
 
-def _load_all_rows():
-    if 'safe_load_data' in globals():
-        try:
-            return safe_load_data()
-        except Exception:
-            pass
-    # Fallback to disk if safe_load_data not present
-    path = globals().get("DATA_PATH", "")
-    if not path or not os.path.exists(path):
-        return []
+_FINISH_SHOOTER_RE = re.compile(r"\b(\d+/\d+)\s*([+-]{1,2})")
+def _finishing_token_info(short_text: str):
+    toks = [t for t in re.split(r"\s+", (short_text or "").strip()) if t]
+    finish_idx, shooter_pair = None, None
+    for i, tok in enumerate(toks):
+        tl = tok.lower()
+        if "+" in tl or "-" in tl:
+            finish_idx = i
+            m = _FINISH_SHOOTER_RE.search(tok)
+            if m: shooter_pair = m.group(1)
+            break
+    return toks, finish_idx, shooter_pair
+
+_OFFBALL_PAREN_RE = re.compile(r"\(([^)]+)\)")
+def _receivers_from_segment(seg: str):
+    s = seg.strip().lower()
+    act = None
+    for code in sorted(_OFFBALL_CODES, key=len, reverse=True):
+        if code in s:
+            act = code
+            break
+    if not act: return (None, [])
+    left, _right = s.split(act, 1) if act in s else (s, "")
+    mleft = re.search(r"\b(\d+/\d+)\b", left)
+    if not mleft: return (None, [])
+    return (act, [mleft.group(1)])
+
+def _offball_codes_connected_to_shot(short_text: str) -> set[str]:
+    out = set()
+    toks, finish_idx, shooter_pair = _finishing_token_info(short_text)
+    if not toks or finish_idx is None or not shooter_pair:
+        return out
+    scan_text = " ".join(toks[:finish_idx+1])
+    for par in _OFFBALL_PAREN_RE.findall(scan_text):
+        act, receivers = _receivers_from_segment(par)
+        if act and shooter_pair in set(receivers):
+            out.add(act)
+    return out
+
+
+# ===== participants (OP/DP) cleaning wrapper =====
+def _participants_clean(pbp_src: str, short: str):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return (data.get("rows") if isinstance(data, dict) else data) or []
+        op_raw, dp_raw = participants_for_possession(pbp_src, short or "")
     except Exception:
-        return []
+        op_raw, dp_raw = ([], [])
+    op = _clean_name_list_to_roster(op_raw)
+    dp = _clean_name_list_to_roster(dp_raw)
+    return op, dp
 
-
-# ====================== filterable row builders (for UI options + fast client filters) ======================
-
-_DRILL_SIZE_RE = re.compile(r"\b(\d+v\d+)\b", re.IGNORECASE)
-
-def _get_drill_size(drill: str) -> str:
-    if not drill: return ""
-    m = _DRILL_SIZE_RE.search(drill)
-    return (m.group(1) if m else "").lower()
 
 def _rows_full():
-    """Rows with enough fields for filter UI and Shot tab visuals."""
-    data = _load_all_rows()
+    """Rows with rich fields for Shooting tab visuals (1 row per logged possession)."""
     rows_for_plot = []
 
-    for rr in (data or []):
-        pbp_names_src = (rr.get("play_by_play_names") or "")
-        pbp_raw_src   = (rr.get("play_by_play") or "")
-        pbp_src_for_roles = pbp_names_src or pbp_raw_src
-        short = _row_shorthand_text(rr) if ' _row_shorthand_text' in globals() else _row_shorthand_text(rr)
+    # Load using URL/file-aware cache (handles HTTP and local files)
+    data = safe_load_data()
+    if not data:
+        return rows_for_plot
+    if isinstance(data, dict):
+        data = data.get("rows", []) or []
 
-        # Coerce coordinates and filter to valid shots only (for visuals)
+    for rr in (data or []):
+        # --- coords / result ---
         try:
             x = float(rr.get("x")) if str(rr.get("x")).strip() not in ("", "None") else None
             y = float(rr.get("y")) if str(rr.get("y")).strip() not in ("", "None") else None
-        except:
+        except Exception:
             x = y = None
+
+        pbp_names_src = (rr.get("play_by_play_names") or "")
+        pbp_raw_src   = (rr.get("play_by_play") or "")
+        pbp_src_for_roles = pbp_names_src or pbp_raw_src
+        short = _row_shorthand_text(rr)
+
         res = rr.get("result") or result_from_shorthand(pbp_raw_src or short or "")
-        if x is None or y is None or not (0 <= x <= COURT_W) or not (0 <= y <= HALF_H) or res not in ("Make","Miss"):
+        if x is None or y is None or not (0 <= x <= COURT_W) or not (0 <= y <= HALF_H) or res not in ("Make", "Miss"):
             continue
 
         idx = rr.get("shot_index") or 1
-        try:
-            shooter_p, onball_def_p, assister_p, screen_ast_list_p, action_lines = extract_roles_for_shot(pbp_src_for_roles, idx)
-        except Exception:
-            shooter_p = onball_def_p = assister_p = ""; screen_ast_list_p = []
 
-        # Better defenders display from the shot line if available
-        try:
-            _def_disp_from_shot_line = shot_defender_display(pbp_src_for_roles, idx)
-            if _def_disp_from_shot_line:
-                onball_def_p = _def_disp_from_shot_line
-        except Exception:
-            pass
+        # --- roles / defenders from PBP ---
+        shooter_p, onball_def_p, assister_p, screen_ast_list_p, action_lines = extract_roles_for_shot(pbp_src_for_roles, idx)
+        _def_disp_from_shot_line = shot_defender_display(pbp_src_for_roles, idx)
+        if _def_disp_from_shot_line:
+            onball_def_p = _def_disp_from_shot_line
 
         shooter_raw = rr.get("shooter") or shooter_p
         onball_def_raw = rr.get("defenders") or rr.get("defender") or onball_def_p
         assister_raw = rr.get("assister") or assister_p
         screen_ast_list_raw = rr.get("screen_assisters") or rr.get("screen_assister") or screen_ast_list_p or []
+        if isinstance(screen_ast_list_raw, str):
+            screen_ast_list_raw = [screen_ast_list_raw]
 
-        # Connected action codes from shorthand
-        on_types_connected  = set()
-        off_types_connected = set()
+        shot_line = _nth_shot_line(pbp_src_for_roles, idx)
+        on_actions_shotline  = parse_onball_actions_from_pbp([shot_line], (screen_ast_list_raw[0] if screen_ast_list_raw else ""))
+        off_actions_shotline = parse_offball_actions_from_pbp([shot_line])
+        on_types_shotline  = { (a.get("type") or "").lower() for a in on_actions_shotline }
+        off_types_shotline = { (a.get("type") or "").lower() for a in off_actions_shotline }
+
+        on_types_connected  = _onball_codes_connected_to_shot(short)
+        off_types_connected = _offball_codes_connected_to_shot(short)
+
+        # pnp inference
         try:
-            on_types_connected  = _expand_onball_aliases(_onball_codes_connected_to_shot(short))
-            off_types_connected = _expand_offball_aliases(_offball_codes_connected_to_shot(short))
+            shooter_name  = _force_to_roster_name(shooter_raw).lower()
+            assister_name = _force_to_roster_name(assister_raw).lower()
+            screeners     = { _force_to_roster_name(n).lower() for n in _split_names(screen_ast_list_raw) }
+            pnp_cue = ("pnp" in (short or "").lower()) or ("pick and pop" in (pbp_src_for_roles or "").lower())
+            if "pnp" not in on_types_connected:
+                if shooter_name and shooter_name in screeners and assister_name and pnp_cue:
+                    on_types_connected.add("pnp")
         except Exception:
             pass
 
-        # Offense / Defense participants
-        try:
-            off_players, def_players = participants_for_possession(pbp_src_for_roles, short)
-        except Exception:
-            off_players, def_players = ([], [])
+        on_types_connected  = _expand_onball_aliases(on_types_connected)
+        off_types_connected = _expand_offball_aliases(off_types_connected)
 
-        # Defense label
+        off_players, def_players = _participants_clean(pbp_src_for_roles, short)
+
+        # defense label
         try:
             def_label = defense_label_for_shot(pbp_src_for_roles, idx) or "Man to Man"
-        except:
+        except Exception:
             def_label = "Man to Man"
         if "[" in (short or "") and "]" in (short or ""):
             m_zone = re.search(r"\b(\d(?:-\d){1,3})\s*\[", short or "")
@@ -4397,7 +4621,7 @@ def _rows_full():
         rows_for_plot.append({
             **rr,
             "x": x, "y": y, "result": res,
-            "is_three": _is_three(x,y),
+            "is_three": _is_three(x, y),
             "practice_date_str": str(practice),
             "practice_date_obj": _parse_date_any(practice),
             "drill": drill,
@@ -4406,6 +4630,8 @@ def _rows_full():
             "defenders_raw": onball_def_raw,
             "assister_raw": assister_raw,
             "screen_assisters_raw": screen_ast_list_raw or [],
+            "onball_set_from_shotline": sorted(on_types_shotline),
+            "offball_set": sorted(off_types_shotline),
             "onball_connected_set":  sorted(on_types_connected),
             "offball_connected_set": sorted(off_types_connected),
             "off_players": off_players,
@@ -4417,10 +4643,18 @@ def _rows_full():
         })
     return rows_for_plot
 
+
 def _rows_stats_all():
-    """Lightweight rows for Stats tab (works even when no valid shot)."""
-    data = _load_all_rows()
+    """Rows (shots or no-shots) for the Stats tab aggregations."""
     rows_for_stats = []
+
+    # Load using URL/file-aware cache
+    data = safe_load_data()
+    if not data:
+        return rows_for_stats
+    if isinstance(data, dict):
+        data = data.get("rows", []) or []
+
     for rr in (data or []):
         pbp_names_src = (rr.get("play_by_play_names") or "")
         pbp_raw_src   = (rr.get("play_by_play") or "")
@@ -4434,7 +4668,7 @@ def _rows_stats_all():
         try:
             idx = rr.get("shot_index") or 1
             def_label = defense_label_for_shot(pbp_src_for_roles, idx) or "Man to Man"
-        except:
+        except Exception:
             def_label = "Man to Man"
         if "[" in (short or "") and "]" in (short or ""):
             m_zone = re.search(r"\b(\d(?:-\d){1,3})\s*\[", short or "")
@@ -4442,26 +4676,33 @@ def _rows_stats_all():
                 def_label = f"{m_zone.group(1)} Zone"
 
         x = y = None
-        result = None
+        is_three = result = None
         shooter_raw = assister_raw = ""
         screen_ast_list_raw = []
 
         try:
             x = float(rr.get("x")) if str(rr.get("x")).strip() not in ("", "None") else None
             y = float(rr.get("y")) if str(rr.get("y")).strip() not in ("", "None") else None
-        except:
+        except Exception:
             x = y = None
 
         if x is not None and y is not None and 0 <= x <= COURT_W and 0 <= y <= HALF_H:
             result = rr.get("result") or result_from_shorthand(pbp_raw_src or short or "")
+            is_three = _is_three(x, y)
             idx = rr.get("shot_index") or 1
             try:
-                shooter_p, _def_p, assister_p, screen_ast_list_p, _ = extract_roles_for_shot(pbp_src_for_roles, idx)
+                shooter_p, onball_def_p, assister_p, screen_ast_list_p, _ = extract_roles_for_shot(pbp_src_for_roles, idx)
+                _def_disp_from_shot_line = shot_defender_display(pbp_src_for_roles, idx)
+                if _def_disp_from_shot_line:
+                    onball_def_p = _def_disp_from_shot_line
             except Exception:
-                shooter_p = assister_p = ""; screen_ast_list_p = []
+                shooter_p = onball_def_p = assister_p = ""
+                screen_ast_list_p = []
             shooter_raw = rr.get("shooter") or shooter_p or ""
             assister_raw = rr.get("assister") or assister_p or ""
             screen_ast_list_raw = rr.get("screen_assisters") or rr.get("screen_assister") or screen_ast_list_p or []
+            if isinstance(screen_ast_list_raw, str):
+                screen_ast_list_raw = [screen_ast_list_raw]
 
         rows_for_stats.append({
             "practice_date_str": str(practice),
@@ -4473,7 +4714,7 @@ def _rows_stats_all():
             "possession": pbp_raw_src or "",
             "shorthand": short or "",
             "result": result,
-            "is_three": (_is_three(x,y) if (x is not None and y is not None) else None),
+            "is_three": is_three,
             "shooter_raw": shooter_raw,
             "assister_raw": assister_raw,
             "screen_assisters_raw": screen_ast_list_raw,
@@ -4481,7 +4722,25 @@ def _rows_stats_all():
     return rows_for_stats
 
 
-# ====================== filter utils for UI-side rows ======================
+
+def _uniq_sorted(seq):
+    seen = set(); out = []
+    for s in (seq or []):
+        if not s: continue
+        key = str(s).strip(); l = key.lower()
+        if l and l not in seen:
+            seen.add(l); out.append(key)
+    return sorted(out, key=lambda z: z.lower())
+
+def _split_names(s_or_list):
+    if not s_or_list: return []
+    if isinstance(s_or_list, list):
+        raw = []
+        for v in s_or_list:
+            raw += _split_names(v)
+        return _uniq_sorted(raw)
+    return _split_fullname_list(str(s_or_list))
+
 
 def _filter_rows(rows,
                  d_start, d_end,
@@ -4550,48 +4809,281 @@ def _filter_rows(rows,
     return out
 
 
-# ====================== Shot tab: zone fig builder (filtered) ======================
+# ===================== FIX: Clear fade on Close =====================
 
-_ZONE_CENTERS = {
-    1:(24.5,5.5),2:(16.5,5.5),3:(24.5,12),4:(33,6.5),
-    5:(6,3.5),6:(10,14.5),7:(24.5,22),8:(39,14.5),9:(42,3),
-    10:(1,3.5),11:(5.5,20),12:(24.5,29),13:(42.5,21),14:(48.5,2.5)
-}
+def _clear_selection_and_bump(fig: dict) -> dict:
+    """Remove selection + highlight, and return a *new* fig object."""
+    if not fig:
+        return fig
+    fig = copy.deepcopy(fig)
 
-def _build_zone_fig_from_shots(shots):
+    # remove any selectedpoints & give traces fresh uids
+    new_data = []
+    for tr in fig.get("data", []):
+        d = dict(tr) if isinstance(tr, dict) else tr
+        d.pop("selectedpoints", None)
+        d["uid"] = str(uuid4())
+        new_data.append(d)
+    fig["data"] = new_data
+
+    # remove highlight rectangle(s)
+    layout = dict(fig.get("layout", {}) or {})
+    shapes = list(layout.get("shapes", []))
+    layout["shapes"] = [s for s in shapes if not (isinstance(s, dict) and s.get("name") == "shot-highlight")]
+    # do NOT set layout.uirevision here — we'll bump the Graph's uirevision prop instead
+    fig["layout"] = layout
+    return fig
+
+@callback(
+    Output("shot-chart", "figure"),
+    Output("shot-chart", "selectedData"),
+    Output("shot-chart", "clickData"),
+    Output("shot-chart", "uirevision"),   # 🔑 bump the Graph prop, not just layout
+    Input("btn-close-shot", "n_clicks"),
+    State("shot-chart", "figure"),
+    prevent_initial_call=True,
+)
+def on_close_pbp(n, fig):
+    if not n:
+        return no_update, no_update, no_update, no_update
+    new_fig = _clear_selection_and_bump(fig)
+    # bump the Graph component's uirevision so Plotly forgets the selection
+    return new_fig, None, None, str(uuid4())
+# ================================================================================
+
+
+
+
+#-------------------------------------Section 7---------------------------------------
+from collections import defaultdict
+from datetime import date
+import math, copy
+from uuid import uuid4
+from dash import html, no_update, Output, Input, State
+
+def _rows_to_shots(rows):
+    return [{"x": r["x"], "y": r["y"], "result": r["result"]} for r in rows]
+
+def _shooting_tiles(rows):
+    fga = len(rows)
+    fgm = sum(1 for r in rows if r["result"] == "Make")
+    two_a = sum(1 for r in rows if not r.get("is_three"))
+    two_m = sum(1 for r in rows if (not r.get("is_three")) and r["result"] == "Make")
+    thr_a = sum(1 for r in rows if r.get("is_three"))
+    thr_m = sum(1 for r in rows if r.get("is_three") and r["result"] == "Make")
+
+    def pct(m, a): return round((m / a) * 100.0, 1) if a else 0.0
+
+    metrics = [
+        ("FGM", fgm), ("FGA", fga), ("FG%", f"{pct(fgm, fga):.1f}%"),
+        ("2PM", two_m), ("2PA", two_a), ("2P%", f"{pct(two_m, two_a):.1f}%"),
+        ("3PM", thr_m), ("3PA", thr_a), ("3P%", f"{pct(thr_m, thr_a):.1f}%"),
+    ]
+    boxes = [
+        html.Div(
+            [html.Div(name, style={"fontSize": "12px", "color": "#555"}),
+             html.Div(str(val), style={"fontSize": "18px", "fontWeight": 800})],
+            style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px",
+                   "textAlign":"center","background":"white"}
+        )
+        for name, val in metrics
+    ]
+    return html.Div(boxes, style={"display":"grid","gridTemplateColumns":"repeat(3, minmax(80px, 1fr))","gap":"8px"})
+
+def _normalize_display_name(nm: str):
+    return _force_to_roster_name(nm)
+
+def _ensure_player(stats, name):
+    if not name: return
+    if name not in stats:
+        stats[name] = {
+            "Player": name,
+            "PTS":0, "FGM":0,"FGA":0,"FG%":0.0, "2PM":0,"2PA":0,"2P%":0.0,
+            "3PM":0,"3PA":0,"3P%":0.0, "AST":0,"SA":0,"DRB":0,"ORB":0,"TRB":0,
+            "LBTO":0,"DBTO":0,"TO":0, "STL":0,"DEF":0,"BLK":0, "OP":0,"DP":0,
+            "PF_pts":0, "PA_pts":0, "PRAC":0
+        }
+
+def _aggregate_stats_table(rows):
+    def _norm_force(nm: str): return _force_to_roster_name((nm or "").strip())
+    stats = {}; prac_days = defaultdict(set)
+
+    def _ensure(name):
+        if name and name not in stats:
+            stats[name] = {
+                "Player": name,
+                "PTS":0, "FGM":0,"FGA":0,"FG%":0.0, "2PM":0,"2PA":0,"2P%":0.0,
+                "3PM":0,"3PA":0,"3P%":0.0, "AST":0,"SA":0,"DRB":0,"ORB":0,"TRB":0,
+                "LBTO":0,"DBTO":0,"TO":0, "STL":0,"DEF":0,"BLK":0, "OP":0,"DP":0,
+                "PF_pts":0, "PA_pts":0, "PRAC":0
+            }
+
+    for r in rows:
+        pbp_src = r.get("pbp_src_for_roles") or ""
+        short   = r.get("shorthand") or r.get("possession") or ""
+        pday    = r.get("practice_date_obj") or r.get("practice_date_str") or None
+
+        shooter = _norm_force(r.get("shooter_raw") or "")
+        if shooter:
+            _ensure(shooter)
+            stats[shooter]["FGA"] += 1
+            is3 = bool(r.get("is_three"))
+            if r.get("result") == "Make":
+                stats[shooter]["FGM"] += 1
+                if is3: stats[shooter]["3PM"] += 1; stats[shooter]["PTS"] += 3
+                else:   stats[shooter]["2PM"] += 1; stats[shooter]["PTS"] += 2
+            if is3: stats[shooter]["3PA"] += 1
+            else:   stats[shooter]["2PA"] += 1
+            if pday: prac_days[shooter].add(pday)
+
+        assister = _norm_force(r.get("assister_raw") or "")
+        if assister:
+            _ensure(assister); stats[assister]["AST"] += 1
+            if pday: prac_days[assister].add(pday)
+
+        if r.get("result") == "Make":
+            for nm in _split_names(r.get("screen_assisters_raw")):
+                n = _norm_force(nm)
+                if n:
+                    _ensure(n); stats[n]["SA"] += 1
+                    if pday: prac_days[n].add(pday)
+
+        sps = parse_special_stats_from_shorthand(short or "")
+        for nm in (sps.get("def_rebounds") or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["DRB"] += 1
+            if pday: prac_days[n].add(pday)
+        for nm in (sps.get("off_rebounds") or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["ORB"] += 1
+            if pday: prac_days[n].add(pday)
+        for nm in (sps.get("deflections") or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["DEF"] += 1
+            if pday: prac_days[n].add(pday)
+        for nm in (sps.get("steals") or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["STL"] += 1
+            if pday: prac_days[n].add(pday)
+
+        blk_names = set(_norm_force(nm) for nm in (sps.get("blocks") or []))
+        for nm in blockers_from_pbp_for_display(pbp_src): blk_names.add(_norm_force(nm))
+        for n in blk_names:
+            if n:
+                _ensure(n); stats[n]["BLK"] += 1
+                if pday: prac_days[n].add(pday)
+
+        for nm in (sps.get("live_ball_to") or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["LBTO"] += 1
+            if pday: prac_days[n].add(pday)
+        for nm in (sps.get("dead_ball_to") or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["DBTO"] += 1
+            if pday: prac_days[n].add(pday)
+
+        for nm in (sps.get("def_fouls") or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["PF"] = int(stats[n].get("PF",0))+1
+            if pday: prac_days[n].add(pday)
+        for nm in (sps.get("off_fouls") or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["OF"] = int(stats[n].get("OF",0))+1
+            if pday: prac_days[n].add(pday)
+
+        try: op, dp = _participants_clean(pbp_src, short or "")
+        except Exception: op, dp = ([], [])
+
+        for nm in (op or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["OP"] += 1
+            if pday: prac_days[n].add(pday)
+        for nm in (dp or []):
+            n = _norm_force(nm); _ensure(n); stats[n]["DP"] += 1
+            if pday: prac_days[n].add(pday)
+
+        pts_this_row = 3 if r.get("result") == "Make" and r.get("is_three") else (2 if r.get("result") == "Make" else 0)
+        if pts_this_row:
+            for nm in (op or []): n = _norm_force(nm); _ensure(n); stats[n]["PF_pts"] += pts_this_row
+            for nm in (dp or []): n = _norm_force(nm); _ensure(n); stats[n]["PA_pts"] += pts_this_row
+
+    for n, row in stats.items():
+        row["TRB"] = row["ORB"] + row["DRB"]
+        row["TO"]  = row["LBTO"] + row["DBTO"]
+        row["FG%"] = round((row["FGM"]/row["FGA"])*100.0,1) if row["FGA"] else 0.0
+        row["2P%"] = round((row["2PM"]/row["2PA"])*100.0,1) if row["2PA"] else 0.0
+        row["3P%"] = round((row["3PM"]/row["3PA"])*100.0,1) if row["3PA"] else 0.0
+        row["PRAC"] = len(prac_days.get(n, set()))
+
+    cols = ["Player","PTS","FGM","FGA","FG%","2PM","2PA","2P%","3PM","3PA","3P%",
+            "AST","SA","DRB","ORB","TRB","LBTO","DBTO","TO","STL","DEF","BLK",
+            "OP","DP","PF_pts","PA_pts","PRAC"]
+    return [{c: stats[name].get(c, 0) for c in cols} for name in sorted(stats.keys(), key=lambda z: z.lower())]
+
+
+def _create_zone_chart_from_filtered(rows):
+    shots = _rows_to_shots(rows)
     fig = go.Figure()
-    # court lines
     for tr in court_lines_traces(): fig.add_trace(tr)
     for tr in first_zone_line_traces(): fig.add_trace(tr)
     for tr in mini_three_point_line(): fig.add_trace(tr)
     for tr in elbow_lines(): fig.add_trace(tr)
     for tr in diagonal_zone_lines(): fig.add_trace(tr)
 
-    # stats on filtered shots
-    zone_stats = calculate_zone_stats(shots)
+    zone_stats = {}
+    for zid in range(1,15):
+        makes = attempts = 0
+        for s in shots:
+            if point_in_zone(s["x"], s["y"], zid):
+                attempts += 1
+                if s["result"] == "Make": makes += 1
+        pct = (makes/attempts*100.0) if attempts else 0.0
+        zone_stats[zid] = {"makes":makes,"attempts":attempts,"percentage":round(pct,1)}
 
-    for zone_id in range(1, 15):
-        s = zone_stats.get(zone_id, {"makes":0,"attempts":0,"percentage":0.0})
-        rgba = _rgba_for_zone(zone_id, s["attempts"], s["percentage"])
-        add_zone_fill(fig, zone_id=zone_id, step=0.25, rgba=rgba)
+    zone_centers = {
+        1:(24.5,5.5),2:(16.5,5.5),3:(24.5,12),4:(33,6.5),
+        5:(6,3.5),6:(10,14.5),7:(24.5,22),8:(39,14.5),9:(42,3),
+        10:(1,3.5),11:(5.5,20),12:(24.5,29),13:(42.5,21),14:(48.5,2.5)
+    }
+    for zid in range(1,15):
+        s = zone_stats.get(zid, {"makes":0,"attempts":0,"percentage":0.0})
+        rgba = _rgba_for_zone(zid, s["attempts"], s["percentage"])
+        add_zone_fill(fig, zone_id=zid, step=0.25, rgba=rgba)
 
-    for zone_id, center in _ZONE_CENTERS.items():
-        s = zone_stats.get(zone_id, {"makes":0,"attempts":0,"percentage":0.0})
-        makes, atts, pct = s["makes"], s["attempts"], s["percentage"]
-        txt = f"{makes}/{atts}<br>{pct:.1f}%"
-        fig.add_annotation(x=center[0], y=center[1], text=txt,
-                           showarrow=False,
+    for zid, center in zone_centers.items():
+        s = zone_stats.get(zid, {"makes":0,"attempts":0,"percentage":0.0})
+        txt = f"{s['makes']}/{s['attempts']}<br>{s['percentage']:.1f}%"
+        fig.add_annotation(x=center[0], y=center[1], text=txt, showarrow=False,
                            font=dict(size=12, color="black", family="Arial Black"))
+
     fig.update_layout(**base_layout())
     return fig
 
 
-# ====================== UI options initialization ======================
+# ---------- Advanced rows (eFG%, PPS, AST%, TOV%, AST/TO + Ratings) ----------
+def _advanced_from_stats_rows(stats_full):
+    out = []
+    for r in (stats_full or []):
+        FGA = int(r.get("FGA", 0) or 0); FGM = int(r.get("FGM", 0) or 0)
+        TPM = int(r.get("3PM", 0) or 0); PTS = int(r.get("PTS", 0) or 0)
+        AST = int(r.get("AST", 0) or 0); TO  = int(r.get("TO",  0) or 0)
+        OP  = int(r.get("OP",  0) or 0); DP  = int(r.get("DP",  0) or 0)
 
-def _options_from_list(values):
-    return [{"label": v, "value": v} for v in _uniq_sorted(values)]
+        efg  = ((FGM + 0.5*TPM) / FGA * 100.0) if FGA else 0.0
+        pps  = (PTS / FGA) if FGA else 0.0
+        astp = (AST / OP * 100.0) if OP else 0.0
+        tovp = (TO  / OP * 100.0) if OP else 0.0
+        ratio = (AST / TO) if TO else (float("inf") if AST > 0 else 0.0)
 
-@callback(
+        PF_pts = int(r.get("PF_pts",0) or 0); PA_pts = int(r.get("PA_pts",0) or 0)
+        ORtg = 100.0 * (PF_pts/OP) if OP else 0.0
+        DRtg = 100.0 * (PA_pts/DP) if DP else 0.0
+        NET  = ORtg - DRtg
+        PM   = PF_pts - PA_pts
+
+        out.append({
+            "Player": r.get("Player",""), "OP": OP, "DP": DP,
+            "eFG%": round(efg,1), "PPS": round(pps,2),
+            "AST%": round(astp,1), "TOV%": round(tovp,1),
+            "AST/TO": ("∞" if isinstance(ratio,float) and not math.isfinite(ratio) else round(ratio,2)),
+            "ORtg": round(ORtg,1), "DRtg": round(DRtg,1), "NET": round(NET,1), "+/-": PM
+        })
+    return out
+
+
+# ===== populate dynamic filter options =====
+@app.callback(
     Output("flt_drill_size_shoot", "options"),
     Output("flt_drill_full_shoot", "options"),
     Output("flt_shooter", "options"),
@@ -4600,55 +5092,32 @@ def _options_from_list(values):
     Output("flt_screen_assister", "options"),
     Output("flt_drill_size_stats", "options"),
     Output("flt_drill_full_stats", "options"),
-    Output("options_cache", "data"),
-    Input("tabs", "value"),
+    Output("flt_date_range_shoot", "min_date_allowed"),
+    Output("flt_date_range_shoot", "max_date_allowed"),
+    Output("flt_date_range_stats", "min_date_allowed"),
+    Output("flt_date_range_stats", "max_date_allowed"),
+    Input("tabs","value"),
+    prevent_initial_call=False
 )
-def init_filter_options(_tab_val):
-    rows_plot = _rows_full()
-    rows_stats = _rows_stats_all()
-
-    drill_sizes = {r.get("drill_size","") for r in rows_plot if r.get("drill_size")}
-    drills_full = {r.get("drill","") for r in rows_plot if r.get("drill")}
-
-    shooters = set()
-    defenders = set()
-    assisters = set()
-    screeners = set()
-
-    # Prefer roster cache when available
-    roster = list((_get_roster_cache() or {}).values()) if '_get_roster_cache' in globals() else []
-
-    for r in rows_plot:
-        shooters |= set(_clean_name_list_to_roster(_split_names(r.get("shooter_raw"))))
-        defenders |= set(_clean_name_list_to_roster(_split_names(r.get("defenders_raw"))))
-        assisters |= set(_clean_name_list_to_roster(_split_names(r.get("assister_raw"))))
-        screeners |= set(_clean_name_list_to_roster(_split_names(r.get("screen_assisters_raw"))))
-
-    # Merge roster so options never empty even if parsing is sparse
-    if roster:
-        shooters |= set(roster); defenders |= set(roster); assisters |= set(roster); screeners |= set(roster)
-
-    cache = {
-        "roster": roster,
-        "counts": {"shots": len(rows_plot), "rows": len(rows_stats)}
-    }
-
-    return (
-        _options_from_list(drill_sizes),
-        _options_from_list(drills_full),
-        _options_from_list(shooters),
-        _options_from_list(defenders),
-        _options_from_list(assisters),
-        _options_from_list(screeners),
-        _options_from_list(drill_sizes),
-        _options_from_list(drills_full),
-        cache
-    )
+def populate_filter_options(_tab_value):
+    rows = _rows_full()
+    drill_sizes = _uniq_sorted([r.get("drill_size") for r in rows])
+    drills_full = _uniq_sorted([r.get("drill") for r in rows])
+    shooters  = _uniq_sorted([_force_to_roster_name(n) for r in rows for n in _split_names(r.get("shooter_raw"))])
+    defenders = _uniq_sorted([_force_to_roster_name(n) for r in rows for n in _split_names(r.get("defenders_raw"))])
+    assisters = _uniq_sorted([_force_to_roster_name(n) for r in rows for n in _split_names(r.get("assister_raw"))])
+    screeners = _uniq_sorted([_force_to_roster_name(n) for r in rows for n in _split_names(r.get("screen_assisters_raw"))])
+    dates = sorted([d for d in [r.get("practice_date_obj") for r in rows] if isinstance(d, date)])
+    dmin = dates[0] if dates else None; dmax = dates[-1] if dates else None
+    def _opts(lst): return [{"label":x, "value":x} for x in lst]
+    return (_opts(drill_sizes), _opts(drills_full),
+            _opts(shooters), _opts(defenders), _opts(assisters), _opts(screeners),
+            _opts(drill_sizes), _opts(drills_full),
+            dmin, dmax, dmin, dmax)
 
 
-# ====================== Clear filter buttons ======================
-
-@callback(
+# ===== clear filter buttons =====
+@app.callback(
     Output("flt_date_range_shoot", "start_date"),
     Output("flt_date_range_shoot", "end_date"),
     Output("flt_drill_size_shoot", "value"),
@@ -4660,170 +5129,132 @@ def init_filter_options(_tab_val):
     Output("flt_onball", "value"),
     Output("flt_offball", "value"),
     Output("flt_defense_shoot", "value"),
-    Output("shot_chart", "uirevision"),   # bump to clear any lingering selection fade
-    Input("btn_clear_shoot", "n_clicks"),
-    prevent_initial_call=True,
+    Input("btn_clear_shoot","n_clicks"),
+    prevent_initial_call=True
 )
-def clear_shoot_filters(_n):
-    uid = str(uuid4())
-    return None, None, [], [], [], [], [], [], [], [], [], uid
+def clear_shoot_filters(nc):
+    return (None, None, [], [], [], [], [], [], [], [], [])
 
-@callback(
+@app.callback(
     Output("flt_date_range_stats", "start_date"),
     Output("flt_date_range_stats", "end_date"),
     Output("flt_drill_size_stats", "value"),
     Output("flt_drill_full_stats", "value"),
     Output("flt_defense_stats", "value"),
-    Input("btn_clear_stats", "n_clicks"),
-    prevent_initial_call=True,
+    Input("btn_clear_stats","n_clicks"),
+    prevent_initial_call=True
 )
-def clear_stats_filters(_n):
-    return None, None, [], [], []
+def clear_stats_filters(nc):
+    return (None, None, [], [], [])
 
 
-# ====================== Shooting tab: charts + header stats ======================
+# ===== core computation (fast; does NOT react to sel_pos) =====
+@app.callback(
+    Output("shot_chart","figure"),
+    Output("zone_chart","figure"),
+    Output("shooting_stats_box","children"),
+    Output("status","children"),
+    Output(BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table","data"),
+    Output("advanced_stats_table","data"),
 
-def _filters_from_shoot_inputs(ds, de, sz, drill, shooter, defenders, assister, screen_ast, onball, offball, defense):
-    f = empty_shooting_filters() if 'empty_shooting_filters' in globals() else {
-        "date_start":"", "date_end":"", "drill_size":set(), "drill_full":set(),
-        "shooter":set(), "defenders":set(), "assister":set(), "screen_ast":set(),
-        "onball":set(), "offball":set(), "defense":set(),
-    }
-    f["date_start"] = (str(ds)[:10] if ds else "")
-    f["date_end"]   = (str(de)[:10] if de else "")
-    f["drill_size"] = set(sz or [])
-    f["drill_full"] = set(drill or [])
-    f["shooter"]    = set(shooter or [])
-    f["defenders"]  = set(defenders or [])
-    f["assister"]   = set(assister or [])
-    f["screen_ast"] = set(screen_ast or [])
-    f["onball"]     = set(onball or [])
-    f["offball"]    = set(offball or [])
-    f["defense"]    = set(defense or [])
-    return f
+    # SHOOTING filters
+    Input("flt_date_range_shoot","start_date"),
+    Input("flt_date_range_shoot","end_date"),
+    Input("flt_drill_size_shoot","value"),
+    Input("flt_drill_full_shoot","value"),
+    Input("flt_shooter","value"),
+    Input("flt_defenders","value"),
+    Input("flt_assister","value"),
+    Input("flt_screen_assister","value"),
+    Input("flt_onball","value"),
+    Input("flt_offball","value"),
+    Input("flt_defense_shoot","value"),
 
-def _shooting_stats_box_children(tot):
-    # Expects dict with keys from compute_shooting_totals()
-    def cell(h, v):
-        return html.Div(
-            [html.Div(h, style={"fontSize":"12px","opacity":0.75}),
-             html.Div(v, style={"fontSize":"18px","fontWeight":800})],
-            style={"padding":"8px","border":"1px solid #eee","borderRadius":"6px","background":"#fff"}
+    # STATS filters
+    Input("flt_date_range_stats","start_date"),
+    Input("flt_date_range_stats","end_date"),
+    Input("flt_drill_size_stats","value"),
+    Input("flt_drill_full_stats","value"),
+    Input("flt_defense_stats","value"),
+
+    State("sel_pos","data"),   # only to keep highlight if a rebuild happens
+    prevent_initial_call=False
+)
+def compute_all(sd_sh, ed_sh, sz_sh, dr_sh, shtr, defs, asts, scrs, onb, offb, def_sh,
+                sd_st, ed_st, sz_st, dr_st, def_st,
+                sel_coords):
+    try:
+        rows = _rows_full()
+
+        shooting_rows = _filter_rows(
+            rows,
+            _parse_date_any(sd_sh), _parse_date_any(ed_sh),
+            (sz_sh or []), (dr_sh or []),
+            (shtr or []), (defs or []), (asts or []), (scrs or []),
+            (onb or []), (offb or []), (def_sh or []),
+            for_stats_tab=False
         )
-    FGM = tot.get("FGM",0); FGA = tot.get("FGA",0); FGP = tot.get("FGP",0.0)
-    t2M = tot.get("2PM",0); t2A = tot.get("2PA",0); t2P = tot.get("2PP",0.0)
-    t3M = tot.get("3PM",0); t3A = tot.get("3PA",0); t3P = tot.get("3PP",0.0)
-    PTS = tot.get("PTS",0)
-    return [
-        cell("FGM / FGA", f"{FGM}/{FGA}"), cell("FG%", f"{FGP:.1f}%"), cell("PTS", f"{PTS}"),
-        cell("2PM / 2PA", f"{t2M}/{t2A}"), cell("2P%", f"{t2P:.1f}%"), cell("3PM / 3PA", f"{t3M}/{t3A}"),
-        cell("3P%", f"{t3P:.1f}%"),
-    ]
 
-@callback(
-    Output("shot_chart", "figure"),
-    Output("zone_chart", "figure"),
-    Output("shooting_stats_box", "children"),
-    Output("status", "children"),
-    Output("filters_shoot_state", "data"),
-    Input("flt_date_range_shoot", "start_date"),
-    Input("flt_date_range_shoot", "end_date"),
-    Input("flt_drill_size_shoot", "value"),
-    Input("flt_drill_full_shoot", "value"),
-    Input("flt_shooter", "value"),
-    Input("flt_defenders", "value"),
-    Input("flt_assister", "value"),
-    Input("flt_screen_assister", "value"),
-    Input("flt_onball", "value"),
-    Input("flt_offball", "value"),
-    Input("flt_defense_shoot", "value"),
-)
-def update_shoot_tab(ds, de, sz, drill, shooter, defenders, assister, screen_ast, onball, offball, defense):
-    possession_rows = _load_all_rows()
-    filters = _filters_from_shoot_inputs(ds, de, sz, drill, shooter, defenders, assister, screen_ast, onball, offball, defense)
+        rows_stats_base = _rows_stats_all()
+        stats_rows = _filter_rows(
+            rows_stats_base,
+            _parse_date_any(sd_st), _parse_date_any(ed_st),
+            (sz_st or []), (dr_st or []),
+            [], [], [], [], [], [], (def_st or []),
+            for_stats_tab=True
+        )
 
-    # Use Section 3 helpers to build filtered shot list (guaranteed x/y/result)
-    try:
-        shots = collect_shots_for_filters(possession_rows, filters)
-    except Exception:
-        # Fallback: approximate from UI-side filtered rows
-        ui_rows = _filter_rows(_rows_full(),
-                               _parse_date_any(ds), _parse_date_any(de),
-                               sz, drill, shooter, defenders, assister, screen_ast,
-                               onball, offball, defense, for_stats_tab=False)
-        # Convert to "shots" shape minimally
-        shots = [{"x": r["x"], "y": r["y"], "result": r["result"], "value": (3 if r.get("is_three") else 2), "points": (3 if (r["result"]=="Make" and r.get("is_three")) else (2 if r["result"]=="Make" else 0)), "row_ref": r} for r in ui_rows]
+        shots_fig = create_shot_chart(_rows_to_shots(shooting_rows), highlight_coords=(sel_coords or []))
+        zone_fig  = _create_zone_chart_from_filtered(shooting_rows)
 
-    # Shot chart figure accepts shot dicts that include "row_ref"
-    shot_fig = create_shot_chart(shots)
+        # We control dimming ourselves -> keep Plotly in simple event mode
+        shots_fig.update_layout(clickmode="event", uirevision="keep")
+        zone_fig.update_layout(uirevision="keep")
 
-    # Zone chart from filtered shots (custom builder to honor filters)
-    zone_fig = _build_zone_fig_from_shots(shots)
+        tiles = _shooting_tiles(shooting_rows)
+        status_txt = (
+            f"Loaded {len(rows)} shots • "
+            f"Shooting view: {len(shooting_rows)} filtered • "
+            f"Stats view: {len(stats_rows)} filtered"
+        )
 
-    # Header stats
-    try:
-        totals = compute_shooting_totals(shots)
-    except Exception:
-        # Minimal fallback
-        FGA = len(shots or [])
-        FGM = sum(1 for s in shots if s.get("result")=="Make")
-        t2 = [s for s in shots if s.get("value")==2]; t3 = [s for s in shots if s.get("value")==3]
-        tot2M = sum(1 for s in t2 if s.get("result")=="Make")
-        tot3M = sum(1 for s in t3 if s.get("result")=="Make")
-        PTS = sum(int(s.get("points") or 0) for s in shots)
-        pct = (lambda m,a: round(100.0*m/a,1) if a else 0.0)
-        totals = {"FGM":FGM,"FGA":FGA,"FGP":pct(FGM,FGA),"2PM":tot2M,"2PA":len(t2),"2PP":pct(tot2M,len(t2)),"3PM":tot3M,"3PA":len(t3),"3PP":pct(tot3M,len(t3)),"PTS":PTS}
+        stats_full = _aggregate_stats_table(stats_rows)
+        basic_cols = ["Player","PTS","FGM","FGA","FG%","2PM","2PA","2P%","3PM","3PA","3P%",
+                      "AST","SA","DRB","ORB","TRB","LBTO","DBTO","TO","STL","DEF","BLK","PRAC"]
+        stats_basic = [{c: r.get(c, 0) for c in basic_cols} for r in stats_full]
+        stats_adv = _advanced_from_stats_rows(stats_full)
 
-    stats_children = _shooting_stats_box_children(totals)
-    status = f"{len(shots)} shots match current filters."
+        return shots_fig, zone_fig, tiles, status_txt, stats_basic, stats_adv
 
-    return shot_fig, zone_fig, stats_children, status, filters
+    except Exception as e:
+        fb_rows  = _rows_full()
+        fb_shots = _rows_to_shots(fb_rows)
+        fallback_shots = create_shot_chart(fb_shots, highlight_coords=(sel_coords or []))
+        fallback_zone  = _create_zone_chart_from_filtered(fb_rows)
+        fallback_shots.update_layout(clickmode="event", uirevision="keep")
+        fallback_zone.update_layout(uirevision="keep")
+        return (fallback_shots, fallback_zone, html.Div(), f"Error computing view: {e}", [], [])
 
 
-# ====================== Stats tab: tables (basic + advanced) ======================
+# ---------------- Legend text population (unchanged) ----------------
+def _legend_bins_for_zone(zid: int):
+    last = None; cuts = []
+    for p in range(0, 101):
+        col = str(_rgba_for_zone(zid, attempts=1, pct=p))
+        if last is None: last = col
+        elif col != last: cuts.append(p); last = col
+    def fmt(a,b): 
+        if a<0: a=0
+        if b>100: b=100
+        return f"{a}–{b}%"
+    if len(cuts) >= 2:
+        t1, t2 = cuts[0], cuts[1]
+        return (fmt(0, max(t1-1,0)), fmt(t1, max(t2-1,t1)), f"{t2}%+")
+    if len(cuts) == 1:
+        t1 = cuts[0]; return (fmt(0, max(t1-1,0)), f"{t1}%+", "—")
+    return ("0–100%", "—", "—")
 
-def _filters_from_stats_inputs(ds, de, sz, drill, defense):
-    return {
-        "date_start": (str(ds)[:10] if ds else ""),
-        "date_end":   (str(de)[:10] if de else ""),
-        "drill_size": set(sz or []),
-        "drill_full": set(drill or []),
-        "defense":    set(defense or []),
-    }
-
-@callback(
-    Output(BASIC_TBL_ID, "data"),
-    Output(ADV_TBL_ID, "data"),
-    Output("filters_stats_state", "data"),
-    Input("flt_date_range_stats", "start_date"),
-    Input("flt_date_range_stats", "end_date"),
-    Input("flt_drill_size_stats", "value"),
-    Input("flt_drill_full_stats", "value"),
-    Input("flt_defense_stats", "value"),
-)
-def update_stats_tables(ds, de, sz, drill, defense):
-    possession_rows = _load_all_rows()
-    filters = _filters_from_stats_inputs(ds, de, sz, drill, defense)
-
-    # Prefer Section 4 one-stop if present
-    if 'compute_tables_with_ratings' in globals():
-        basic_rows, adv_rows = compute_tables_with_ratings(possession_rows, filters)
-    else:
-        # Fallback path
-        rows = compute_player_stats_table(possession_rows, filters) if 'compute_player_stats_table' in globals() else []
-        if 'apply_pf_pa_and_ratings_to_player_rows' in globals():
-            apply_pf_pa_and_ratings_to_player_rows(rows, possession_rows, filters)
-        if 'split_basic_and_advanced_rows' in globals():
-            basic_rows, adv_rows = split_basic_and_advanced_rows(rows)
-        else:
-            basic_rows, adv_rows = rows, []
-
-    return basic_rows, adv_rows, filters
-
-
-# ====================== Zone legend labels ======================
-
-@callback(
+@app.callback(
     Output("legend_close_low", "children"),
     Output("legend_close_mid", "children"),
     Output("legend_close_high", "children"),
@@ -4833,417 +5264,118 @@ def update_stats_tables(ds, de, sz, drill, defense):
     Output("legend_three_low", "children"),
     Output("legend_three_mid", "children"),
     Output("legend_three_high", "children"),
-    Input("tabs", "value"),
+    Input("zone_chart", "figure"),
+    prevent_initial_call=False
 )
-def fill_zone_legend(_):
-    # These thresholds match _rgba_for_zone() bins
-    return (
-        "≤ 50%", "51–60%", "≥ 61%",
-        "≤ 35%", "36–45%", "≥ 46%",
-        "≤ 25%", "26–35%", "≥ 36%",
-    )
+def update_zone_legend(_zone_fig):
+    return (*_legend_bins_for_zone(1), *_legend_bins_for_zone(6), *_legend_bins_for_zone(12))
 
 
+# ===== Helper: set per-point marker opacity & manage highlight boxes instantly =====
+def _set_marker_opacity_on_fig(fig_dict, sel_coords):
+    """
+    Apply per-point opacities ONLY to marker traces (the shots).
+    While details are open (sel_coords non-empty): selected point(s)=1.0, others=0.25.
+    When details close (sel_coords empty): all points back to full color 1.0.
+    Also adds/removes the small gray highlight rectangle for the selection.
+    """
+    if not fig_dict:
+        return fig_dict
 
-#-------------------------------------Section 7---------------------------------------
-import math
-from uuid import uuid4
-from dash import html, dcc, callback, Output, Input, State, no_update
+    f = copy.deepcopy(fig_dict)
+    data = f.get("data", []) or []
+    lay  = dict(f.get("layout", {}) or {})
+    shapes = list(lay.get("shapes", []) or [])
 
-# ---------- tiny math helpers ----------
-def _hyp(x, y):
-    try:
-        return math.hypot(float(x) - RIM_X, float(y) - RIM_Y)
-    except Exception:
-        return 0.0
+    # remove any previous highlight rectangles (we re-add if needed)
+    shapes = [s for s in shapes if str(s.get("fillcolor", "")).lower() != "#e6e6e6"]
 
-def _shot_value(x, y):
-    try:
-        return 3 if math.hypot(float(x) - RIM_X, float(y) - RIM_Y) >= THREE_R - 1e-9 else 2
-    except Exception:
-        return 2
+    selset = {(round(float(x), 3), round(float(y), 3)) for (x, y) in (sel_coords or [])}
 
-def _find_zone_id(x, y):
-    for zid in range(1, 15):
-        try:
-            if point_in_zone(float(x), float(y), zid):
-                return zid
-        except Exception:
-            pass
-    return None
-
-# ---------- code → friendly label maps (from Section 5 options) ----------
-_ON_MAP  = {opt["value"]: opt["label"] for opt in (globals().get("ONBALL_OPTIONS", []) or [])}
-_OFF_MAP = {opt["value"]: opt["label"] for opt in (globals().get("OFFBALL_OPTIONS", []) or [])}
-
-def _labels_for_codes(codes, m):
-    out = []
-    for c in (codes or []):
-        c = (c or "").lower()
-        if not c: 
+    # update marker trace opacities
+    for tr in data:
+        mode = str(tr.get("mode", "") or "")
+        if "markers" not in mode.lower():
             continue
-        out.append(m.get(c, c.upper()))
-    # de-dupe, keep order
-    seen = set(); dedup=[]
-    for v in out:
-        k = v.lower()
-        if k not in seen:
-            seen.add(k); dedup.append(v)
-    return dedup
-
-# ---------- specials pretty printer ----------
-def _specials_block(short_text, pbp_text):
-    rows = special_stats_with_pbp_blocks(short_text or "", pbp_text or "") if 'special_stats_with_pbp_blocks' in globals() else []
-    if not rows:
-        return html.Div()
-    items = []
-    for r in rows:
-        label = r.get("label","")
-        players = ", ".join(r.get("players", []) or [])
-        if not players:
+        xs = list(tr.get("x", []) or [])
+        ys = list(tr.get("y", []) or [])
+        n  = min(len(xs), len(ys))
+        if n == 0:
             continue
-        items.append(html.Li([
-            html.Span(f"{label}: ", style={"fontWeight":700}),
-            html.Span(players)
-        ]))
-    if not items:
-        return html.Div()
-    return html.Div(
-        [html.Div("Special Events", style={"fontWeight":800, "marginBottom":"4px"}),
-         html.Ul(items, style={"margin":"4px 0 0 16px"})],
-        style={"marginTop":"10px"}
-    )
-
-# ---------- map click → selection store ----------
-@callback(
-    Output("sel_pos", "data"),
-    Input("shot_chart", "clickData"),
-    prevent_initial_call=True
-)
-def set_selection_from_click(clickData):
-    try:
-        if not clickData:
-            return []
-        pt = (clickData or {}).get("points", [{}])[0]
-        x = pt.get("x", None); y = pt.get("y", None)
-        if x is None or y is None:
-            return []
-        # store as a single-coordinate list so other callbacks can highlight/fade
-        return [(float(x), float(y))]
-    except Exception:
-        return []
-
-# ---------- details panel builder ----------
-def _shot_details_layout(shot_dict: dict, row: dict, shot_index: int) -> html.Div:
-    x = shot_dict.get("x"); y = shot_dict.get("y")
-    res = shot_dict.get("result") or ""
-    val = shot_dict.get("value") or _shot_value(x, y)
-    pts = int(shot_dict.get("points") or (val if res == "Make" else 0))
-    dist = _hyp(x, y)
-    zid = _find_zone_id(x, y)
-
-    # Pull PBP + shorthand + roles
-    pbp = _row_possession_text(row) if ' _row_possession_text' in globals() else _row_possession_text(row)
-    short = _row_shorthand_text(row)
-    shooter, def_disp, assister, screen_list, _ = _row_roles_and_lines(row)
-
-    # Prefer the shot-line defenders formatter + help cue
-    try:
-        def_disp = shot_defender_display(pbp, shot_index) or def_disp
-        help_tag = " (help)" if shot_has_help(pbp, shot_index) else ""
-    except Exception:
-        help_tag = ""
-
-    # Defense label for this shot
-    try:
-        def_label = defense_label_for_shot(pbp, shot_index)
-    except Exception:
-        def_label = "Man to Man"
-
-    # Connected actions from shorthand
-    try:
-        on_codes  = _onball_codes_connected_to_shot(short)
-        off_codes = _offball_codes_connected_to_shot(short)
-    except Exception:
-        on_codes, off_codes = set(), set()
-    on_labels  = _labels_for_codes(on_codes, _ON_MAP)
-    off_labels = _labels_for_codes(off_codes, _OFF_MAP)
-
-    # Participants (OP/DP) for this possession
-    try:
-        op_list, dp_list = participants_for_possession(pbp, short)
-    except Exception:
-        op_list, dp_list = [], []
-
-    # Specials w/ PBP blockers merged
-    specials = _specials_block(short, pbp)
-
-    # Meta grid
-    def _row(label, value):
-        return html.Div([
-            html.Div(label, style={"fontSize":"12px","opacity":0.7}),
-            html.Div(value if value else "—", style={"fontWeight":700})
-        ], style={"padding":"6px 8px","border":"1px solid #eee","borderRadius":"6px","background":"#fff"})
-
-    meta = html.Div([
-        _row("Shooter", shooter),
-        _row("Result", f"{res} ({val} pts FG)" if res in ("Make","Miss") else res),
-        _row("Points", str(pts)),
-        _row("Defender(s)", (def_disp or "") + help_tag),
-        _row("Assister", assister),
-        _row("Screen Assist(s)", ", ".join(screen_list or []) or "—"),
-        _row("Defense", def_label),
-        _row("On-Ball Action", ", ".join(on_labels) or "—"),
-        _row("Off-Ball Action", ", ".join(off_labels) or "—"),
-        _row("Distance", f"{dist:.1f} ft"),
-        _row("Zone", f"Zone {zid}" if zid else "—"),
-        _row("Drill", _row_drill_label(row)),
-        _row("Practice Date", str(row.get("practice_date") or row.get("date") or "")),
-    ], style={
-        "display":"grid", "gridTemplateColumns":"repeat(2, minmax(220px, 1fr))",
-        "gap":"8px"
-    })
-
-    # PBP text (excerpt)
-    pbp_block = html.Div([
-        html.Div("Possession Text", style={"fontWeight":800, "marginBottom":"4px"}),
-        html.Pre(pbp or "—", style={"whiteSpace":"pre-wrap","margin":0,"background":"#fafafa","border":"1px solid #eee","padding":"8px","borderRadius":"6px"})
-    ], style={"marginTop":"10px"})
-
-    # Participants
-    parts = html.Div([
-        html.Div("Participants", style={"fontWeight":800, "marginBottom":"4px"}),
-        html.Div([
-            html.Div([html.Span("Offense: ", style={"fontWeight":700}), html.Span(", ".join(op_list or []) or "—")]),
-            html.Div([html.Span("Defense: ", style={"fontWeight":700}), html.Span(", ".join(dp_list or []) or "—")]),
-        ], style={"background":"#fafafa","border":"1px solid #eee","padding":"8px","borderRadius":"6px"})
-    ], style={"marginTop":"10px"})
-
-    header = html.Div([
-        html.Span("Shot Details", style={"fontSize":"18px","fontWeight":800}),
-        html.Button("Close", id="btn_close_shot", n_clicks=0,
-                    style={"marginLeft":"auto","height":"28px","padding":"0 10px","border":"1px solid #ddd","borderRadius":"6px","background":"#fff","cursor":"pointer"})
-    ], style={"display":"flex","alignItems":"center","gap":"10px","marginBottom":"8px"})
-
-    return html.Div([header, meta, specials, parts, pbp_block],
-                    style={"border":"1px solid #eee","borderRadius":"8px","padding":"10px","background":"white"})
-
-def _shot_match(sel_xy, shots):
-    """Find first shot in shots whose (x,y) matches selection within tolerance."""
-    if not sel_xy or not shots:
-        return None
-    sx, sy = sel_xy
-    for s in shots:
-        try:
-            x = float(s.get("x")); y = float(s.get("y"))
-            if abs(x - sx) < 1e-6 and abs(y - sy) < 1e-6:
-                return s
-        except Exception:
-            continue
-    # fallback tolerant match (for any minor float jitter)
-    for s in shots:
-        try:
-            x = float(s.get("x")); y = float(s.get("y"))
-            if round(x, 3) == round(sx, 3) and round(y, 3) == round(sy, 3):
-                return s
-        except Exception:
-            continue
-    return None
-
-# Build details whenever selection or shooting filters change.
-@callback(
-    Output("shot_details", "children"),
-    Output("sel_pos", "data", allow_duplicate=True),  # auto-clear if the selection no longer exists after a filter change
-    Input("sel_pos", "data"),
-    State("filters_shoot_state", "data"),
-    prevent_initial_call=True
-)
-def render_shot_details(sel_coords, filters_state):
-    try:
-        if not sel_coords:
-            return html.Div(), no_update
-
-        # Rebuild the *current* filtered shot list using the saved filter state from Section 6
-        possession_rows = _load_all_rows() if '_load_all_rows' in globals() else safe_load_data()
-        if 'collect_shots_for_filters' in globals():
-            shots = collect_shots_for_filters(possession_rows, filters_state or {})
+        marker = dict(tr.get("marker", {}) or {})
+        if selset:
+            marker["opacity"] = [
+                1.0 if (round(float(xs[i]), 3), round(float(ys[i]), 3)) in selset else 0.25
+                for i in range(n)
+            ]
         else:
-            # minimal fallback if helper missing
-            shots = []
-            for r in (_rows_full() if '_rows_full' in globals() else []):
-                shots.append({
-                    "x": r.get("x"), "y": r.get("y"), "result": r.get("result"),
-                    "value": (3 if r.get("is_three") else 2),
-                    "points": (3 if (r.get("result")=="Make" and r.get("is_three")) else (2 if r.get("result")=="Make" else 0)),
-                    "row_ref": r
-                })
+            marker["opacity"] = 1.0  # scalar restores full color immediately
+        tr["marker"] = marker
+        tr.pop("selectedpoints", None)
+        tr.pop("selected", None)
+        tr.pop("unselected", None)
 
-        # Find the shot that was clicked
-        shot = _shot_match(sel_coords[0], shots)
-        if not shot:
-            # selection no longer exists (filters changed); clear store and panel
-            return html.Div(), []
+    # add highlight rectangle(s) when there is a selection
+    if selset:
+        L = 1.2
+        for (hx, hy) in selset:
+            shapes.append({
+                "type": "rect",
+                "x0": hx - L/2, "y0": hy - L/2, "x1": hx + L/2, "y1": hy + L/2,
+                "line": {"color": "#888", "width": 1},
+                "fillcolor": "#e6e6e6",
+                "layer": "below"
+            })
 
-        row = shot.get("row_ref") or {}
-        shot_index = row.get("shot_index") or 1
+    # force immediate client update; keep clickmode simple
+    lay["shapes"] = shapes
+    lay["selectionrevision"] = str(uuid4())
+    lay["transition"] = {"duration": 0}
+    lay["clickmode"] = "event"
+    f["layout"] = lay
+    f["data"] = data
+    return f
 
-        details = _shot_details_layout(shot, row, shot_index)
-        # Make sure the chart returns to event mode and highlights this shot
-        return details, no_update
 
-    except Exception:
-        # On any failure, show nothing rather than breaking the app, and keep current selection
-        return html.Div(), no_update
+# ===== INSTANT fade controller — only tweaks the existing figure =====
+@app.callback(
+    Output("shot_chart", "figure", allow_duplicate=True),
+    Input("sel_pos", "data"),           # [] on Close, [(x,y)] when viewing details
+    State("shot_chart", "figure"),
+    prevent_initial_call=True
+)
+def instant_fade(sel_coords, fig):
+    if not fig:
+        return no_update
+    return _set_marker_opacity_on_fig(fig, sel_coords or [])
+
+
+# ===== Close button clears selection (triggers instant_fade to restore colors) =====
+@app.callback(
+    Output("sel_pos", "data", allow_duplicate=True),
+    Input("btn_close_shot", "n_clicks"),
+    prevent_initial_call=True
+)
+def _clear_sel_store(_n):
+    return []
+
 
 
 
 #------------------------------------Section 8---------------------------------------
-import re, os
-from dash import html, no_update, Output, Input, State, ALL, callback
-
-# Dash >=2.9: ctx; older versions: callback_context
-try:
-    from dash import ctx
-except Exception:  # pragma: no cover
-    from dash import callback_context as ctx
-
-
-# ===== Compatibility shims (silence Pylance & keep runtime safe) =====
-# These are only defined if the project didn't already provide them (Section 6).
-if '_expand_onball_aliases' not in globals():
-    _ONBALL_ALIAS_MAP = {
-        "pnp": {"pnp", "pick and pop", "pick & pop"},
-        "pnr": {"pnr", "pick and roll", "pick & roll"},
-        "dho": {"dho", "dribble handoff"},
-        "ho":  {"ho", "handoff"},
-        "slp": {"slp", "slip"},
-        "gst": {"gst", "ghost"},
-        "kp":  {"kp", "keep"},
-        "rj":  {"rj", "reject"},
-        "p":   {"p", "post up", "post-up"},
-        "rs":  {"rs", "re-screen", "rescreen"},
-        "d":   {"d", "drive"},
-    }
-    def _expand_onball_aliases(codes: set[str]) -> set[str]:
-        out = set()
-        for c in (codes or set()):
-            cl = (c or "").lower()
-            if not cl:
-                continue
-            if cl in _ONBALL_ALIAS_MAP:
-                out |= {s.lower() for s in _ONBALL_ALIAS_MAP[cl]}
-            else:
-                out.add(cl)
-        return out
-
-if '_onball_codes_connected_to_shot' not in globals():
-    # Parse on-ball codes that are tied to the finishing token (before the first + or -).
-    def _onball_codes_connected_to_shot(short_text: str) -> set[str]:
-        if not short_text:
-            return set()
-        toks = [t for t in re.split(r"\s+", short_text.strip()) if t]
-        if not toks:
-            return set()
-        finish_idx = None
-        for i, tok in enumerate(toks):
-            if "+" in tok or "-" in tok:
-                finish_idx = i
-                break
-        scan_range = range(len(toks)) if finish_idx is None else range(0, finish_idx + 1)
-        # Canonical codes we recognize (kept small on purpose; alias expansion happens later).
-        known = {"d","p","pnr","pnp","slp","gst","rj","dho","ho","kp","rs"}
-        found = set()
-        for i in scan_range:
-            tl = toks[i].lower()
-            for code in known:
-                if code and code in tl:
-                    found.add(code)
-        return found
-
-if '_expand_offball_aliases' not in globals():
-    _OFFBALL_ALIAS_MAP = {
-        "bd":   {"bd", "backdoor", "backdoor cut"},
-        "pn":   {"pn", "pin down", "pindown"},
-        "fl":   {"fl", "flare", "flare screen"},
-        "awy":  {"awy", "away", "away screen"},
-        "hm":   {"hm", "hammer", "hammer screen"},
-        "crs":  {"crs", "cross", "cross screen"},
-        "wdg":  {"wdg", "wedge", "wedge screen"},
-        "rip":  {"rip", "rip screen"},
-        "ucla": {"ucla", "ucla screen"},
-        "stg":  {"stg", "stagger", "stagger screen", "stagger screens"},
-        "ivs":  {"ivs", "iverson", "iverson screen", "iverson screens"},
-        "elv":  {"elv", "elevator", "elevator screen", "elevator screens"},
-    }
-    def _expand_offball_aliases(codes: set[str]) -> set[str]:
-        out = set()
-        for c in (codes or set()):
-            cl = (c or "").lower()
-            if not cl:
-                continue
-            if cl in _OFFBALL_ALIAS_MAP:
-                out |= {s.lower() for s in _OFFBALL_ALIAS_MAP[cl]}
-            else:
-                out.add(cl)
-        return out
-
-if '_offball_codes_connected_to_shot' not in globals():
-    _OFFBALL_CODES = {"bd","pn","fl","awy","hm","crs","wdg","rip","ucla","stg","ivs","elv"}
-    _OFFBALL_PAREN_RE = re.compile(r"\(([^)]+)\)")
-    _FINISH_SHOOTER_RE = re.compile(r"\b(\d+/\d+)\s*[+-]{1,2}")
-
-    def _offball_codes_connected_to_shot(short_text: str) -> set[str]:
-        if not short_text:
-            return set()
-        toks = [t for t in re.split(r"\s+", short_text.strip()) if t]
-        finish_idx = None
-        shooter_pair = None
-        for i, tok in enumerate(toks):
-            if "+" in tok or "-" in tok:
-                finish_idx = i
-                m = _FINISH_SHOOTER_RE.search(tok)
-                if m:
-                    shooter_pair = m.group(1)
-                break
-        if finish_idx is None or not shooter_pair:
-            return set()
-        scan_text = " ".join(toks[:finish_idx + 1])
-        out = set()
-        for par in _OFFBALL_PAREN_RE.findall(scan_text):
-            s = par.strip().lower()
-            act = None
-            for code in sorted(_OFFBALL_CODES, key=len, reverse=True):
-                if code in s:
-                    act = code
-                    break
-            if not act:
-                continue
-            left = s.split(act, 1)[0]
-            if re.search(rf"\b{re.escape(shooter_pair)}\b", left):
-                out.add(act)
-        return out
-
 
 # ===== details panel =====
-@callback(
+@app.callback(
     [Output("shot_details", "children"),
      Output("sel_pos", "data")],
     [Input("shot_chart", "clickData"),
-     Input({"type": "close_details", "idx": ALL}, "n_clicks")],
+     Input({"type":"close_details","idx":ALL}, "n_clicks")],
     prevent_initial_call=False
 )
 def show_shot_details(clickData, close_clicks):
-    # Who triggered?
-    try:
-        trig_id = getattr(ctx, "triggered_id", None)
-        if trig_id is None and getattr(ctx, "triggered", None):  # legacy path
-            trig_id = ctx.triggered[0]["prop_id"].split(".", 1)[0]
-        if isinstance(trig_id, dict) and trig_id.get("type") == "close_details":
-            return ("", [])
-        if isinstance(trig_id, str) and "close_details" in trig_id:
-            return ("", [])
-    except Exception:
-        pass
+    ctx = callback_context
+    if ctx and ctx.triggered and "close_details" in ctx.triggered[0]["prop_id"]:
+        return ("", [])
 
     try:
         if not clickData or "points" not in clickData or not clickData["points"]:
@@ -5256,9 +5388,8 @@ def show_shot_details(clickData, close_clicks):
         if not rows_for_plot:
             return no_update, no_update
 
-        # nearest shot in that possession
         def dist2(r):
-            return (r["x"] - x_clicked) ** 2 + (r["y"] - y_clicked) ** 2
+            return (r["x"] - x_clicked)**2 + (r["y"] - y_clicked)**2
         r = sorted(rows_for_plot, key=dist2)[0]
 
         idx = r.get("shot_index")
@@ -5279,7 +5410,7 @@ def show_shot_details(clickData, close_clicks):
         pbp_names_src = (r.get("play_by_play_names") or "")
         pbp_raw_src   = (r.get("play_by_play") or "")
         pbp_src_for_roles = pbp_names_src or pbp_raw_src
-        short = r.get("shorthand") or ""
+        short = r.get("shorthand") or ""  # <<< use dedicated shorthand field
 
         # Roles from PBP (fallbacks to row fields)
         shooter, onball_def, assister, screen_ast_list, action_lines = extract_roles_for_shot(pbp_src_for_roles, idx or 1)
@@ -5294,7 +5425,7 @@ def show_shot_details(clickData, close_clicks):
         onball_actions = _patch_bring_over_halfcourt(onball_actions, pbp_src_for_roles)
         offball_actions = parse_offball_actions_from_pbp(action_lines)
 
-        # Keep only on-ball actions connected to THIS shot's shooter
+        # ---- Only keep on-ball actions connected to THIS SHOT's shooter
         def _connected_to_shooter(a, shooter_name: str) -> bool:
             s = (shooter_name or "").strip().lower()
             if not s:
@@ -5305,7 +5436,7 @@ def show_shot_details(clickData, close_clicks):
                 a.get("receiver",""), a.get("receiver_def",""),
                 a.get("intended",""), a.get("intended_def",""),
                 a.get("giver",""), a.get("giver_def",""),
-                a.get("screener",""), a.get("screener_def",""),
+                a.get("screener",""), a.get("screener_def","")
             ]
             for srec in (a.get("screeners") or []):
                 cand_fields.append(srec.get("name",""))
@@ -5326,9 +5457,9 @@ def show_shot_details(clickData, close_clicks):
 
         roster_full_list = _collect_roster_for_group(rows_for_plot, gid_key)
 
-        shooter   = _norm_block(shooter, roster_full_list)
+        shooter = _norm_block(shooter, roster_full_list)
         onball_def = _norm_block(onball_def, roster_full_list)
-        assister  = _norm_block(assister, roster_full_list)
+        assister = _norm_block(assister, roster_full_list)
 
         _base_defs = _split_fullname_list(onball_def) or ([onball_def] if onball_def else [])
         _base_defs = [_norm_block(nm, roster_full_list) for nm in _base_defs if nm]
@@ -5336,7 +5467,8 @@ def show_shot_details(clickData, close_clicks):
         _def_list_for_count = _split_fullname_list(onball_def_display)
         _multi_defenders = len(_def_list_for_count) >= 2
 
-        uniq_screens, seen_sa = [], set()
+        uniq_screens = []
+        seen_sa = set()
         for nm in (screen_ast_list or []):
             for piece in _split_fullname_list(nm):
                 nm2 = _norm_block(piece, roster_full_list)
@@ -5345,16 +5477,14 @@ def show_shot_details(clickData, close_clicks):
                     uniq_screens.append(nm2); seen_sa.add(low)
         screen_ast_list = uniq_screens
 
-        # Normalize names within action objects
+        # Normalize names in action objects
         for a in onball_actions:
-            for k in ("bh","bh_def","screener","screener_def","giver","giver_def",
-                      "receiver","receiver_def","keeper","keeper_def","intended","intended_def"):
-                if k in a:
-                    a[k] = _norm_block(a[k], roster_full_list)
+            for k in ("bh","bh_def","screener","screener_def","giver","giver_def","receiver","receiver_def","keeper","keeper_def","intended","intended_def"):
+                if k in a: a[k] = _norm_block(a[k], roster_full_list)
             if a.get("screeners"):
                 for s in a["screeners"]:
                     s["name"] = _norm_block(s.get("name",""), roster_full_list)
-                    s["def"]  = _norm_block(s.get("def",""),  roster_full_list)
+                    s["def"]  = _norm_block(s.get("def",""), roster_full_list)
             if a.get("coverages"):
                 for c in a["coverages"]:
                     if "onto" in c and c["onto"]:
@@ -5362,11 +5492,10 @@ def show_shot_details(clickData, close_clicks):
 
         for a in offball_actions:
             for k in ("coming_off","coming_off_def"):
-                if k in a:
-                    a[k] = _norm_block(a[k], roster_full_list)
+                if k in a: a[k] = _norm_block(a[k], roster_full_list)
             for s in a.get("screeners", []):
                 s["name"] = _norm_block(s.get("name",""), roster_full_list)
-                s["def"]  = _norm_block(s.get("def",""),  roster_full_list)
+                s["def"]  = _norm_block(s.get("def",""), roster_full_list)
             if a.get("coverages"):
                 for c in a["coverages"]:
                     if "onto" in c and c["onto"]:
@@ -5384,12 +5513,12 @@ def show_shot_details(clickData, close_clicks):
             if t not in _screen_handoff_types and a.get("coverages"):
                 a["coverages"] = [c for c in a["coverages"] if (c.get("cov") != "sw")]
 
-        # Prefer screeners inferred from actions when "screen assist" is named in PBP
+        # If PBP text mentions "screen assist", prefer screeners inferred from actions
         sa_phrase = "screen assist" in ((pbp_names_src or pbp_raw_src or "").lower())
         if sa_phrase:
             scr_from_actions = []
             for a in onball_actions:
-                if a.get("type") in ("pnr","pnp","rs"):
+                if a.get("type") in ("pnr", "pnp", "rs"):
                     if a.get("screeners"):
                         scr_from_actions.extend([s.get("name","") for s in a["screeners"] if s.get("name")])
                     elif a.get("screener"):
@@ -5429,9 +5558,9 @@ def show_shot_details(clickData, close_clicks):
                 blocks += [line("Ball Handler", a.get("bh", a.get("keeper",""))),
                            line("Ball Handler Defender", a.get("bh_def", a.get("keeper_def","")))]
                 if t == "kp":
-                    if a.get("intended"):     blocks.append(line("Intended receiver", a.get("intended","")))
+                    if a.get("intended"): blocks.append(line("Intended receiver", a.get("intended","")))
                     if a.get("intended_def"): blocks.append(line("Intended defender", a.get("intended_def","")))
-                    if a.get("coverages"):    blocks.append(line("Coverage", cov_text(a.get("coverages"))))
+                    if a.get("coverages"): blocks.append(line("Coverage", cov_text(a.get("coverages"))))
                 return html.Div(blocks, style={"margin":"8px 0","padding":"8px","border":"1px solid #ddd","borderRadius":"8px"})
             if t == "p":
                 rows = [("Action", a.get("label","")), ("Posting up", a.get("bh","")), ("Defending Post up", a.get("bh_def",""))]
@@ -5466,7 +5595,7 @@ def show_shot_details(clickData, close_clicks):
                     rows += [("Coming off screen", a.get("coming_off","")), ("Defender on coming-off player", a.get("coming_off_def",""))]
                     scr_txt = ", ".join(s.get("name","") for s in (a.get("screeners") or []))
                     scr_def_txt = ", ".join(s.get("def","") for s in (a.get("screeners") or []))
-                    if scr_txt:     rows.append(("Screener(s)", scr_txt))
+                    if scr_txt: rows.append(("Screener(s)", scr_txt))
                     if scr_def_txt: rows.append(("Screener(s) Defender(s)", scr_def_txt))
                 if a.get("coverages"): rows.append(("Coverage", cov_text(a.get("coverages"))))
                 return html.Div([mini_table(rows)], style={"margin":"8px 0","padding":"8px","border":"1px solid #ddd","borderRadius":"8px"})
@@ -5475,7 +5604,7 @@ def show_shot_details(clickData, close_clicks):
         practice = r.get("practice_date_str") or ""
         drill = r.get("drill") or ""
 
-        # Defense label (prefer parsed; allow shorthand override like 2-3[...])
+        # Defense label (prefer parsed; allow shorthand override if tags like 2-3[...])
         try:
             def_label = defense_label_for_shot(pbp_src_for_roles, idx or 1) or "Man to Man"
         except Exception:
@@ -5484,13 +5613,14 @@ def show_shot_details(clickData, close_clicks):
             m_zone = re.search(r"\b(\d(?:-\d){1,3})\s*\[", short)
             def_label = f"{m_zone.group(1)} Zone" if m_zone else def_label
 
-        # Participants
+        # Participants (use pbp + shorthand)
         try:
             _op, _dp = participants_for_possession(pbp_src_for_roles, short)
         except Exception:
             _op, _dp = ([], [])
 
-        op_list, seen_op = [], set()
+        op_list = []
+        seen_op = set()
         for nm in (_op or []):
             nm = _strip_trailing_modifiers(nm)
             nn = _norm_block(nm, roster_full_list)
@@ -5498,7 +5628,8 @@ def show_shot_details(clickData, close_clicks):
             if nn and k not in seen_op:
                 seen_op.add(k); op_list.append(nn)
 
-        dp_list, seen_dp = [], set()
+        dp_list = []
+        seen_dp = set()
         for nm in (_dp or []):
             nm = _strip_trailing_modifiers(nm)
             nn = _norm_block(nm, roster_full_list)
@@ -5527,7 +5658,7 @@ def show_shot_details(clickData, close_clicks):
             ], style={"marginTop":"2px"})
         ], style={"display":"flex","justifyContent":"space-between","alignItems":"baseline","gap":"10px","flexWrap":"wrap"})
 
-        # Close button
+        # Close button at top-right
         top_close = html.Div(
             html.Button(
                 "Close",
@@ -5538,7 +5669,10 @@ def show_shot_details(clickData, close_clicks):
             style={"display":"flex","justifyContent":"flex-end","marginBottom":"6px"}
         )
 
-        header = html.Div(header_top, style={"display":"flex","justifyContent":"space-between","alignItems":"center"})
+        header = html.Div(
+            header_top,
+            style={"display":"flex","justifyContent":"space-between","alignItems":"center"}
+        )
 
         ident_rows = [
             ("Shooter", shooter),
@@ -5551,7 +5685,7 @@ def show_shot_details(clickData, close_clicks):
         if _shot_out_of_help and not _multi_defenders:
             ident_rows.append(("Out of help", "Yes"))
 
-        # Specials (shorthand + PBP merge)
+        # Specials: use shorthand, merged with PBP block detections
         specials_rows = special_stats_with_pbp_blocks(short, pbp_src_for_roles) or []
 
         def _clean_display_name(tok: str) -> str:
@@ -5572,7 +5706,8 @@ def show_shot_details(clickData, close_clicks):
         for row in (specials_rows or []):
             lbl = row.get("label", "")
             raw_players = row.get("players", []) or []
-            names, seen = [], set()
+            names = []
+            seen = set()
             for p in raw_players:
                 nn = _clean_display_name(p)
                 k = (nn or "").lower()
@@ -5581,51 +5716,67 @@ def show_shot_details(clickData, close_clicks):
             if lbl and names:
                 _spec_by_label[lbl] = names
 
-        # Extra inferences from PBP text
+        # Add extra inferences from PBP free text (names) where useful
         txt_for_infer = _clean_frag(pbp_names_src or pbp_raw_src or "")
         if txt_for_infer:
             _DEFLECT_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+deflects\b", re.IGNORECASE)
-            def_names = [_clean_display_name(m.group(1)) for m in re.finditer(_DEFLECT_SUBJ_RE, txt_for_infer)]
+            def_names = []
+            for m in re.finditer(_DEFLECT_SUBJ_RE, txt_for_infer):
+                def_names.append(_clean_display_name(m.group(1)))
             if def_names:
                 base = _spec_by_label.get("Deflection", [])
                 base_l = {b.lower() for b in base}
                 merged = base + [n for n in def_names if n and n.lower() not in base_l]
-                if merged: _spec_by_label["Deflection"] = merged
+                if merged:
+                    _spec_by_label["Deflection"] = merged
 
             _STEAL_SUBJ_RE    = re.compile(rf"({_FULLNAME})\s+(?:steal(?:s|ed)?|stole)\b", re.IGNORECASE)
             _STEAL_PASSIVE_RE = re.compile(rf"\bsteal(?:s|ed)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
-            stl_names = [_clean_display_name(m.group(1)) for m in re.finditer(_STEAL_SUBJ_RE, txt_for_infer)]
-            stl_names += [_clean_display_name(m.group(1)) for m in re.finditer(_STEAL_PASSIVE_RE, txt_for_infer)]
+            stl_names = []
+            for m in re.finditer(_STEAL_SUBJ_RE, txt_for_infer):
+                stl_names.append(_clean_display_name(m.group(1)))
+            for m in re.finditer(_STEAL_PASSIVE_RE, txt_for_infer):
+                stl_names.append(_clean_display_name(m.group(1)))
             if stl_names:
                 base = _spec_by_label.get("Steal", [])
                 base_l = {b.lower() for b in base}
                 merged = base + [n for n in stl_names if n and n.lower() not in base_l]
-                if merged: _spec_by_label["Steal"] = merged
+                if merged:
+                    _spec_by_label["Steal"] = merged
 
             _OFF_FOUL_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+commits\s+an?\s+offensive\s+foul\b", re.IGNORECASE)
             _OFF_FOUL_BY_RE   = re.compile(rf"\boffensive\s+foul\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
-            off_foul_names = [_clean_display_name(m.group(1)) for m in re.finditer(_OFF_FOUL_SUBJ_RE, txt_for_infer)]
-            off_foul_names += [_clean_display_name(m.group(1)) for m in re.finditer(_OFF_FOUL_BY_RE, txt_for_infer)]
+            off_foul_names = []
+            for m in re.finditer(_OFF_FOUL_SUBJ_RE, txt_for_infer):
+                off_foul_names.append(_clean_display_name(m.group(1)))
+            for m in re.finditer(_OFF_FOUL_BY_RE, txt_for_infer):
+                off_foul_names.append(_clean_display_name(m.group(1)))
             if off_foul_names:
                 base = _spec_by_label.get("Offensive Foul", [])
                 base_l = {b.lower() for b in base}
                 merged = base + [n for n in off_foul_names if n and n.lower() not in base_l]
-                if merged: _spec_by_label["Offensive Foul"] = merged
+                if merged:
+                    _spec_by_label["Offensive Foul"] = merged
 
             _DEF_FOUL_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+commits\s+an?\s+defensive\s+foul\b", re.IGNORECASE)
             _DEF_FOUL_BY_RE   = re.compile(rf"\bdefensive\s+foul\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
-            def_foul_names = [_clean_display_name(m.group(1)) for m in re.finditer(_DEF_FOUL_SUBJ_RE, txt_for_infer)]
-            def_foul_names += [_clean_display_name(m.group(1)) for m in re.finditer(_DEF_FOUL_BY_RE, txt_for_infer)]
+            def_foul_names = []
+            for m in re.finditer(_DEF_FOUL_SUBJ_RE, txt_for_infer):
+                def_foul_names.append(_clean_display_name(m.group(1)))
+            for m in re.finditer(_DEF_FOUL_BY_RE, txt_for_infer):
+                def_foul_names.append(_clean_display_name(m.group(1)))
             if def_foul_names:
                 base = _spec_by_label.get("Defensive Foul", [])
                 base_l = {b.lower() for b in base}
                 merged = base + [n for n in def_foul_names if n and n.lower() not in base_l]
-                if merged: _spec_by_label["Defensive Foul"] = merged
+                if merged:
+                    _spec_by_label["Defensive Foul"] = merged
 
-        # Identity + specials (Block once)
+        # Ensure Block appears once in the identity list
         ident_rows_ext = list(ident_rows)
         if _spec_by_label.get("Block"):
             ident_rows_ext.append(("Block", ", ".join(_spec_by_label["Block"])))
+
         _special_order = [
             "Defensive Rebound","Offensive Rebound","Deflection","Steal",
             "Live Ball Turnover","Dead Ball Turnover","Defensive Foul",
@@ -5639,8 +5790,7 @@ def show_shot_details(clickData, close_clicks):
                 ident_rows_ext.append((lbl, ", ".join(ppl)))
 
         identity = html.Div([mini_table(ident_rows_ext)],
-                            style={"margin":"8px 0","padding":"8px","border":"1px solid #ddd",
-                                   "borderRadius":"8px","background":"#fafafa"})
+                            style={"margin":"8px 0","padding":"8px","border":"1px solid #ddd","borderRadius":"8px","background":"#fafafa"})
 
         oblocks = [action_block(a) for a in onball_actions]
         fblocks = [action_block(a) for a in offball_actions]
@@ -5673,6 +5823,7 @@ def show_shot_details(clickData, close_clicks):
 
 
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", "8051"))
     print(f"Starting visualization server on http://localhost:{port}")
     try:
