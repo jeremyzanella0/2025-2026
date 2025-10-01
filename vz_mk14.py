@@ -7,7 +7,7 @@ import dash
 from dash import Dash, html, dcc, Output, Input, State, no_update, callback_context, ALL
 import plotly.graph_objects as go
 from flask import Response
-import requests  # needed if any data paths are HTTP(S) URLs
+import requests  # allow URL data sources
 
 log = logging.getLogger(__name__)
 
@@ -55,28 +55,8 @@ def _load_json_any(src):
         r = requests.get(src, timeout=10)
         r.raise_for_status()
         return r.json()
-    else:
-        with open(src, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-def safe_load_data(src=DATA_PATH):
-    """
-    Safely load possessions as a list of dicts. If JSON is a dict, coerce to [].
-    """
-    try:
-        data = _load_json_any(src)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            # Some writers wrap rows under a key; try common keys, else fallback to []
-            for key in ("rows", "data", "possessions", "items"):
-                if key in data and isinstance(data[key], list):
-                    return data[key]
-            return []
-        return []
-    except Exception as e:
-        print(f"[safe_load_data] failed to load {src}: {e}")
-        return []
+    with open(src, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 def _count_json(src) -> int:
     try:
@@ -106,9 +86,67 @@ def _schema_keys(src, k=10):
         print(f"[schema_keys] {src}: {e}")
     return []
 
+# -------- Single, canonical possessions loader (replaces duplicate safe_load_data) -----
+_CACHED_ROWS = []
+_DATA_LAST_MTIME = None  # local files only
+
+def load_possessions_cached(src=DATA_PATH, use_cache=True):
+    """
+    Load possessions as a list[dict].
+    - Local file: cache by mtime.
+    - URL: no mtime; light cache if use_cache=True (keeps last good).
+    Returns [] on failure.
+    """
+    global _CACHED_ROWS, _DATA_LAST_MTIME
+
+    # URL source: just try to fetch; if it fails, fall back to cache.
+    if _is_url(src):
+        if not use_cache:
+            try:
+                j = _load_json_any(src)
+                rows = j.get("rows", j) if isinstance(j, dict) else j
+                rows = [r for r in (rows or []) if isinstance(r, dict)]
+                _CACHED_ROWS = rows
+                return list(rows)
+            except Exception as e:
+                print(f"[load_possessions_cached][URL fresh] {e}")
+                return list(_CACHED_ROWS)
+        # cached path
+        try:
+            j = _load_json_any(src)
+            rows = j.get("rows", j) if isinstance(j, dict) else j
+            rows = [r for r in (rows or []) if isinstance(r, dict)]
+            _CACHED_ROWS = rows
+            return list(rows)
+        except Exception as e:
+            print(f"[load_possessions_cached][URL cached] {e}")
+            return list(_CACHED_ROWS)
+
+    # Local file path
+    if not os.path.exists(src):
+        return list(_CACHED_ROWS)
+    try:
+        mtime = os.path.getmtime(src)
+    except Exception:
+        return list(_CACHED_ROWS)
+
+    if use_cache and _DATA_LAST_MTIME == mtime and _CACHED_ROWS:
+        return list(_CACHED_ROWS)
+
+    try:
+        j = _load_json_any(src)
+        rows = j.get("rows", j) if isinstance(j, dict) else j
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+        _CACHED_ROWS = rows
+        _DATA_LAST_MTIME = mtime
+        return list(rows)
+    except Exception as e:
+        print(f"[load_possessions_cached][local] {e}")
+        return list(_CACHED_ROWS)
+
 def _peek_json(src, limit=2):
     try:
-        data = safe_load_data(src)
+        data = load_possessions_cached(src, use_cache=False)
     except Exception as e:
         print(f"[PEEK] failed to load {src}: {e}")
         return
@@ -135,7 +173,7 @@ def _parse_probe(src):
     """Print the raw fields the parser relies on for the first possession."""
     print("=== PARSE PROBE (first possession) ===")
     try:
-        rows = safe_load_data(src)
+        rows = load_possessions_cached(src, use_cache=False)
         if not rows:
             print("[PARSE PROBE] No possessions loaded or wrong format.")
         else:
@@ -149,12 +187,23 @@ def _parse_probe(src):
         print("[PARSE PROBE ERROR]", e)
     print("======================================")
 
+
+# --- Back-compat loader alias (so older code calling safe_load_data keeps working) ---
+def safe_load_data(path_like: str | None = None):
+    """
+    Back-compat wrapper around load_possessions_cached.
+    Returns a list[dict] of possession rows.
+    Accepts optional path; defaults to DATA_PATH.
+    """
+    src = path_like if path_like else DATA_PATH
+    return load_possessions_cached(src, use_cache=True)
+
+
 # --- DIAGNOSTICS @ IMPORT -----------------------------------------------------
 print("=== Startup data check ===")
 for src in (DATA_PATH, ROSTER_PATH, PRACTICES_PATH):
     try:
         if _is_url(src):
-            # Try a lightweight HEAD
             try:
                 h = requests.head(src, timeout=5)
                 clen = h.headers.get("Content-Length", "?")
@@ -197,36 +246,27 @@ def _healthz():
 @server.route("/debug/first-possession")
 def _debug_first_possession():
     try:
-        rows = safe_load_data(DATA_PATH)
+        rows = load_possessions_cached(DATA_PATH, use_cache=True)
         first = rows[0] if rows else {}
         pbp_names = (first.get("play_by_play_names") or "").strip()
         pbp_raw   = (first.get("play_by_play") or "").strip()
         poss      = (first.get("possession") or "").strip()
         idx       = first.get("shot_index") or 1
 
-        # Choose best available source text for parsing
-        pbp_src = pbp_names or pbp_raw or poss
+        # Choose best available source text for parsing (THIS is the key fix)
+        pbp_src = pbp_names or pbp_raw or poss or (first.get("shorthand") or "")
 
-        # Call your real parser if available; otherwise return placeholders.
         shooter = onball_def = assister = ""
         screen_asts = []
         candidates = []
 
         try:
-            # This function is expected to be defined later in this file.
-            # Name resolves at call time, so it's safe even though this route is declared here.
-            parsed = extract_roles_for_shot(pbp_src, idx)  # type: ignore[name-defined]
-            # Accept either a tuple or dict return, depending on your implementation
-            if isinstance(parsed, tuple) and len(parsed) >= 5:
-                shooter, onball_def, assister, screen_asts, candidates = parsed[:5]
-            elif isinstance(parsed, dict):
-                shooter       = parsed.get("shooter", "")
-                onball_def    = parsed.get("onball_defender", "")
-                assister      = parsed.get("assister", "")
-                screen_asts   = parsed.get("screen_assists", []) or []
-                candidates    = parsed.get("candidates", []) or []
+            parsed_tuple = extract_roles_for_shot(pbp_src, idx)  # defined below
+            # Expected: (shooter, onball_def, assister, screen_ast_list, candidates)
+            if isinstance(parsed_tuple, (list, tuple)) and len(parsed_tuple) >= 5:
+                shooter, onball_def, assister, screen_asts, candidates = parsed_tuple[:5]
             else:
-                candidates = [f"Unexpected parse return type: {type(parsed)}"]
+                candidates = [f"Unexpected parse return: {type(parsed_tuple)}"]
         except Exception as e:
             candidates = [f"extract_roles_for_shot error: {e}"]
 
@@ -265,7 +305,7 @@ def _safe_serve_layout():
                 html.H1("CWB Practice Stats"),
                 html.Div("The main layout failed to load. Check server logs for details."),
                 html.Pre(STATUS_TEXT),
-                html.Pre(traceback.format_exc()),
+                html.Pre(traceback.format_exc() ),
             ],
             style={"padding": "2rem", "fontFamily": "system-ui, Arial, sans-serif"},
         )
@@ -287,12 +327,9 @@ LANE_X0, LANE_X1 = RIM_X - LANE_W/2.0, RIM_X + LANE_W/2.0
 THREE_R, SIDELINE_INSET = 22.15, 3.0
 LEFT_POST_X, RIGHT_POST_X = SIDELINE_INSET, COURT_W - SIDELINE_INSET
 
-# Global cache
-CACHED_DATA = []
-
-# NEW (mk5 perf): also cache by file modified time to avoid needless re-parses
-_DATA_LAST_MTIME = 0.0
-_CACHED_DATA_BY_MTIME = []  # same content as CACHED_DATA but keyed by mtime
+# Global cache used by loader above
+# (kept near geometry so later sections can import if needed)
+# _CACHED_ROWS, _DATA_LAST_MTIME already declared above
 
 def result_from_shorthand(s: str):
     if not s:
@@ -317,53 +354,6 @@ def rows_to_shots(rows):
             continue
     return shots
 
-def safe_load_data():
-    """Load and cache the *raw possession rows* with caching on failure.
-
-    mk5 improvement:
-      - Only re-parse when the DATA_PATH's mtime changes.
-      - If file is missing or mid-write/corrupt, return last good cache.
-      - IMPORTANT: returns the original possession ROWS (dicts), not {x,y,result} shots.
-      - FIX: always return a shallow copy so Dash callbacks see a new object and recompute stats.
-    """
-    global CACHED_DATA, _DATA_LAST_MTIME, _CACHED_DATA_BY_MTIME
-
-    # If the file doesn't exist, keep serving whatever we had last.
-    if not os.path.exists(DATA_PATH):
-        return list(_CACHED_DATA_BY_MTIME or CACHED_DATA)
-
-    try:
-        mtime = os.path.getmtime(DATA_PATH)
-    except Exception:
-        # If we can't stat it, keep the last known good.
-        return list(_CACHED_DATA_BY_MTIME or CACHED_DATA)
-
-    # If file hasn't changed, return the mtime-cached parse (super fast).
-    if mtime == _DATA_LAST_MTIME and _CACHED_DATA_BY_MTIME:
-        # return a shallow copy to trigger downstream recompute without reparsing
-        return list(_CACHED_DATA_BY_MTIME)
-
-    # Otherwise, try to (re)load and parse
-    try:
-        with open(DATA_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Support both {"rows":[...]} and [...] shapes
-        rows = data.get("rows", data) if isinstance(data, dict) else (data or [])
-        # Ensure it's a list[dict]
-        rows = [r for r in (rows or []) if isinstance(r, dict)]
-
-        # update both caches on success
-        CACHED_DATA = rows
-        _CACHED_DATA_BY_MTIME = rows
-        _DATA_LAST_MTIME = mtime
-        # return a shallow copy so Dash callbacks see a new object
-        return list(rows)
-
-    except Exception:
-        # If load/parse fails (e.g., mid-write), return last good cache
-        return list(_CACHED_DATA_BY_MTIME or CACHED_DATA)
-
 # ------------------------- Roster loading (same as entry app) -------------------------
 
 def _load_roster_from_disk():
@@ -372,19 +362,23 @@ def _load_roster_from_disk():
     Returns dict like {"12": "Joleen Lusk", "21": "Adrianna Fontana", ...}
     """
     try:
-        if os.path.exists(ROSTER_PATH):
+        if _is_url(ROSTER_PATH):
+            raw = _load_json_any(ROSTER_PATH) or {}
+        elif os.path.exists(ROSTER_PATH):
             with open(ROSTER_PATH, "r", encoding="utf-8") as f:
                 raw = json.load(f) or {}
-            out = {}
-            for k, v in raw.items():
-                try:
-                    kk = str(int(k))  # jersey numbers as strings
-                    name = (v or "").strip()
-                    if name:
-                        out[kk] = name
-                except:
-                    continue
-            return out
+        else:
+            return {}
+        out = {}
+        for k, v in (raw or {}).items():
+            try:
+                kk = str(int(k))  # jersey numbers as strings
+                name = (v or "").strip()
+                if name:
+                    out[kk] = name
+            except:
+                continue
+        return out
     except Exception as e:
         print(f"[roster load] {e}")
     return {}
@@ -476,14 +470,13 @@ def _normalize_list(names):
             seen.add(key)
     return out
 
-# ---- NEW (zero-shot support): jersey → name and shorthand turnover parsing ----
+# ---- jersey helpers / turnover parsing (kept from prior version) -------------
 _JNUM_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)")
 _LBTO_RE = re.compile(r"\blbto\b", re.IGNORECASE)
 _DBTO_RE = re.compile(r"\bdbto\b", re.IGNORECASE)
 _STL_RE  = re.compile(r"\bstl(\d{1,2})\b", re.IGNORECASE)
 
 def roster_name_from_jersey(jersey: str, roster_dict: dict | None = None) -> str:
-    """Map a jersey string (e.g. '20') to the full roster name, if present."""
     roster = roster_dict or _get_roster_cache()
     try:
         j = str(int(str(jersey).strip()))
@@ -492,25 +485,12 @@ def roster_name_from_jersey(jersey: str, roster_dict: dict | None = None) -> str
         return ""
 
 def parse_onball_pair_from_shorthand(s: str) -> tuple[str, str]:
-    """
-    Return ('offense_jersey','defense_jersey') from the leading 'A/B' shorthand
-    (e.g., '1/20 lbto' -> ('1','20')). Returns ('','') if not present.
-    """
     m = _JNUM_RE.search(s or "")
     if not m:
         return ("","")
     return (m.group(1), m.group(2))
 
 def parse_turnover_tokens(s: str) -> dict:
-    """
-    Inspect a shorthand blob and report turnover/steal tokens.
-    Returns:
-      {
-        "lbto": True/False,
-        "dbto": True/False,
-        "steal_jersey": "11" | ""      # from 'stl11' if present
-      }
-    """
     t = s or ""
     return {
         "lbto": bool(_LBTO_RE.search(t)),
@@ -519,57 +499,31 @@ def parse_turnover_tokens(s: str) -> dict:
     }
 
 def is_zero_shot_possession(row: dict) -> bool:
-    """
-    True when a possession has no '+'/'++'/'-' result token (no shot) but
-    includes a turnover token like lbto/dbto.
-    """
     poss = (row or {}).get("possession", "") or ""
     return (result_from_shorthand(poss) is None) and (_LBTO_RE.search(poss) or _DBTO_RE.search(poss))
 
 def extract_zero_shot_events(row: dict, roster_dict: dict | None = None) -> dict:
-    """
-    For possessions without a shot, extract who turned it over and who stole it.
-    Returns (empty names when not inferable):
-      {
-        "turnover_by": "Full Name" | "",
-        "turnover_type": "LBTO" | "DBTO" | "",
-        "steal_by": "Full Name" | ""
-      }
-    Logic:
-      - Offense/defense jerseys are taken from the leading 'A/B' token.
-      - If 'lbto' or 'dbto' present, turnover_by is the offense jersey.
-      - If 'stl##' present, that jersey is credited with a steal.
-    """
     roster = roster_dict or _get_roster_cache()
     poss = (row or {}).get("possession", "") or ""
-    off_j, def_j = parse_onball_pair_from_shorthand(poss)
+    off_j, _def_j = parse_onball_pair_from_shorthand(poss)
     toks = parse_turnover_tokens(poss)
-
     to_type = "LBTO" if toks.get("lbto") else ("DBTO" if toks.get("dbto") else "")
     to_by = roster_name_from_jersey(off_j, roster)
     stl_by = roster_name_from_jersey(toks.get("steal_jersey",""), roster)
-
     return {
         "turnover_by": to_by if to_type else "",
         "turnover_type": to_type,
         "steal_by": stl_by
     }
-# ---- END (zero-shot support) -------------------------------------------------
 
-# --- NEW: practices meta loader + date helpers + PRAC computation -------------
-
+# --- practices meta loader (unchanged) ---------------------------------------
 def load_practices_meta(path=PRACTICES_PATH):
-    """
-    Load practices metadata written by the entry app when a practice starts:
-      {
-        "practice-YYYY-MM-DD": {
-          "practice_date": "YYYY-MM-DD",
-          "absent_numbers": ["12","23", ...]
-        },
-        ...
-      }
-    Returns {} if file missing or unreadable.
-    """
+    if _is_url(path):
+        try:
+            return _load_json_any(path) or {}
+        except Exception as e:
+            print(f"[practices load URL] {e}")
+            return {}
     if not os.path.exists(path):
         return {}
     try:
@@ -581,8 +535,6 @@ def load_practices_meta(path=PRACTICES_PATH):
         return {}
 
 def _norm_date_yyyy_mm_dd(s):
-    """Accept 'YYYY-MM-DD' or 'MM/DD/YYYY' and return 'YYYY-MM-DD' or None."""
-    # FIX: ensure datetime is available inside this helper
     from datetime import datetime
     if not s:
         return None
@@ -598,7 +550,6 @@ def _norm_date_yyyy_mm_dd(s):
         return None
 
 def _date_in_range(d, start_d, end_d):
-    """All args are 'YYYY-MM-DD' or None. Inclusive if bounds provided."""
     if not d:
         return False
     if start_d and d < start_d:
@@ -608,13 +559,7 @@ def _date_in_range(d, start_d, end_d):
     return True
 
 def compute_practices_played_counts(roster_map, practices_meta, start_date=None, end_date=None):
-    """
-    Compute PRAC per player (by jersey):
-      - For each practice in range, every jersey NOT listed in absent_numbers gets +1.
-    Returns dict { "12": 5, "23": 4, ... }.
-    """
-    # local import to avoid changing your global imports footprint elsewhere
-    from datetime import datetime  # safe: only used in helpers above
+    from datetime import datetime  # not used directly; kept for parity
     start_d = _norm_date_yyyy_mm_dd(start_date) if start_date else None
     end_d   = _norm_date_yyyy_mm_dd(end_date) if end_date else None
 
@@ -636,8 +581,6 @@ def compute_practices_played_counts(roster_map, practices_meta, start_date=None,
                 counts[j] += 1
     return counts
 
-# ------------------------------------------------------------------------------
-
 # ------------------------- Shooter / Defender / Assister parsing -------------------------
 _CAP = r"[A-Z][a-zA-Z0-9.\-']+"
 _FULLNAME = rf"{_CAP}(?:\s+{_CAP})?"
@@ -650,7 +593,7 @@ _MISS_RE  = re.compile(r"\bmiss(?:es|ed)?\b", re.IGNORECASE)
 _ASSIST_BY_RE   = re.compile(rf"(?<!screen )\bassist(?:ed)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
 _ASSIST_WITH_RE = re.compile(rf"({_FULLNAME})\s+(?:with|get[s]?s?\s+the)\s+assist\b", re.IGNORECASE)
 
-# UPDATED: support multiple names after "screen assist by" (commas / 'and') and allow closing punctuation
+# multiple names after "screen assist by"
 _SCREEN_ASSIST_LIST_RE = re.compile(
     rf"\bscreen\s+assist\s+by\s+((?:{_FULLNAME}(?:\s*(?:,|and)\s*)?)+)[\s\).,!;:]*",
     re.IGNORECASE
@@ -660,13 +603,10 @@ _FROM_GUARDED_RE = re.compile(rf"\bfrom\s+({_FULLNAME})\s+guarded\s+by\s+({_FULL
 _TO_GUARDED_RE   = re.compile(r"\bto\s+({_FULLNAME})\s+guarded\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
 _FOR_GUARDED_RE  = re.compile(r"\bfor\s+({_FULLNAME})\s+guarded\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
 
-# ---- scrub trailing verbs accidentally glued to a name
 _VERB_TAILS = {
     "makes","made","misses","missed","brings","bring","passes","pass","drives","drive",
     "posts","posting","screens","screen","cuts","cut","hands","handoff","handoffs","with","gets","get","keeps","keep",
-    # extras seen in off-ball text
     "comes","rolls","pops","slips","ghosts","rejects",
-    # NEW: rescreen variants so "Lusk rescreens" -> "Lusk"
     "rescreen","rescreens","rescreened","rescreening","re-screen","re-screens","re-screened","re-screening"
 }
 def _trim_trailing_verb(name: str) -> str:
@@ -676,7 +616,6 @@ def _trim_trailing_verb(name: str) -> str:
         parts = parts[:-1]
     return " ".join(parts)
 
-# NEW: strip leading prepositions/glue before names ("and Boyd" -> "Boyd")
 def _strip_leading_preps(s: str) -> str:
     return re.sub(r"^(?:from|by|to|off|of|the|and)\s+", "", (s or "").strip(), flags=re.IGNORECASE)
 
@@ -697,7 +636,6 @@ def _nth_shot_line(pbp_text: str, n_index: int) -> str:
         return shot_lines[0]
     return pbp_text or ""
 
-# === NEW: normalize any name outputs against roster ===
 def _norm(nm: str) -> str:
     return _normalize_to_roster(_strip_leading_preps(_trim_trailing_verb((nm or "").strip())))
 
@@ -735,19 +673,10 @@ def _parse_assister(text: str, prefer_line: str = "") -> str:
         if m: return _norm(m.group(1))
     return ""
 
-# ===================== NEW: Blocker extraction from PBP text =====================
-# These helpers DO NOT change existing parsing behavior; they enable downstream
-# code to render "Block: <Name>" when shorthand lacks a jersey (e.g., "blks").
+# Blocker names (optional)
 _BLOCKS_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+block(?:s|ed|ing)?\s+(?:the\s+)?shot\b", re.IGNORECASE)
 _BLOCKS_BY_RE   = re.compile(rf"\b(?:shot\s+)?block(?:s|ed|ing)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
-
 def parse_blockers_from_pbp(pbp_text: str, prefer_line: str = "") -> list[str]:
-    """
-    Find shot blocker name(s) from play-by-play natural language, e.g.:
-      - 'Lusk blocks the shot'
-      - 'Shot blocked by Lusk'
-    Returns a de-duped, roster-normalized list of full names.
-    """
     names = []
     seen = set()
     for src in (prefer_line, pbp_text or ""):
@@ -755,34 +684,29 @@ def parse_blockers_from_pbp(pbp_text: str, prefer_line: str = "") -> list[str]:
         if not t:
             continue
         for m in re.finditer(_BLOCKS_SUBJ_RE, t):
-            nm = _norm(m.group(1))
-            k = nm.lower()
+            nm = _norm(m.group(1)); k = nm.lower()
             if nm and k not in seen:
                 names.append(nm); seen.add(k)
         for m in re.finditer(_BLOCKS_BY_RE, t):
-            nm = _norm(m.group(1))
-            k = nm.lower()
+            nm = _norm(m.group(1)); k = nm.lower()
             if nm and k not in seen:
                 names.append(nm); seen.add(k)
     return names
-# =================== END: Blocker extraction from PBP text =======================
-
-# ---- helpers for multi-name parsing ----
 
 def _split_fullname_list(blob: str) -> list[str]:
-    """Split a blob like 'Fontana and Tillotson' or 'Adrianna Fontana, Brooke Tillotson'."""
     names = []
-    # allow trailing punctuation/paren
     blob = re.sub(r"[)\].,!;:\s]+$", "", blob or "")
     for nm in re.findall(_FULLNAME, blob or "", flags=re.IGNORECASE):
         nm = _strip_leading_preps(_trim_trailing_verb(nm.strip()))
         if nm:
             names.append(nm)
-    # NEW: normalize and de-dupe against roster
     return _normalize_list(names)
 
+_SCREEN_ASSIST_LIST_RE = re.compile(
+    rf"\bscreen\s+assist\s+by\s+((?:{_FULLNAME}(?:\s*(?:,|and)\s*)?)+)[\s\).,!;:]*",
+    re.IGNORECASE
+)
 def _parse_screen_assister(text: str, prefer_line: str = "") -> list[str]:
-    """Collect screen assists from the shot line or possession text, de-duped."""
     names = []
     seen = set()
     for src in (prefer_line, text):
@@ -798,7 +722,6 @@ def _parse_screen_assister(text: str, prefer_line: str = "") -> list[str]:
                     seen.add(low)
     return names
 
-# Fallback shooter: last full name before make/miss
 def _guess_shooter_from_make_miss(line: str) -> str:
     if not line: return ""
     m = _MAKE_RE.search(line) or _MISS_RE.search(line)
@@ -807,25 +730,17 @@ def _guess_shooter_from_make_miss(line: str) -> str:
     names = re.findall(_FULLNAME, prefix)
     return _norm(names[-1]) if names else ""
 
-# ================== NEW: multi-defender & "rotating over" parsing ==================
-# Detect a guarded-by list like: "guarded by Campbell and McAnally"
-# and optional per-name tag "rotating over" e.g. "Lusk rotating over"
+# Multi-defender parsing
 _GUARDED_BY_BLOCK_RE = re.compile(r"\bguarded\s+by\s+(.+?)\s*(?:$|[.!)]|\bmake|\bmiss|\bpasses|\bdriv|\bpost|\bwith|\bassisted)", re.IGNORECASE)
 _GUARDED_DEF_ITEM_RE = re.compile(rf"({_FULLNAME})(?:\s+rotating\s+over)?", re.IGNORECASE)
 _HELP_LINE_RE = re.compile(r"\bhelp(?:s|ed|ing)?\b|\bsteps\s+in\s+to\s+help\b", re.IGNORECASE)
 
 def _parse_defenders_with_tags_from_line(line: str):
-    """
-    Return list of dicts: [{"name": Full Name, "rotating_over": bool}, ...]
-    from a shot line like "Fontana guarded by Lusk rotating over" or
-    "Lusk guarded by Campbell and McAnally misses the shot".
-    """
     t = _clean_frag(line or "")
     out = []
     seen = set()
     m = _GUARDED_BY_BLOCK_RE.search(t)
     if not m:
-        # fallback to single pair, for back-compat
         a, b = _first_guard_pair(line)
         if b:
             low = b.lower()
@@ -835,7 +750,6 @@ def _parse_defenders_with_tags_from_line(line: str):
         return out
 
     blob = m.group(1) or ""
-    # Split on commas/ands but rely on name matcher to extract cleanly
     for mm in re.finditer(_GUARDED_DEF_ITEM_RE, blob):
         nm = _norm(mm.group(1))
         rot = bool(re.search(r"\s+rotating\s+over\s*$", mm.group(0), re.IGNORECASE))
@@ -847,10 +761,6 @@ def _parse_defenders_with_tags_from_line(line: str):
     return out
 
 def _format_defenders_for_display(def_list):
-    """
-    Join defenders into a single display string, appending ' rotating over'
-    to any name tagged as rotating_over=True.
-    """
     if not def_list:
         return ""
     parts = []
@@ -858,25 +768,23 @@ def _format_defenders_for_display(def_list):
         nm = d.get("name","")
         if not nm: 
             continue
-        if d.get("rotating_over"):
-            parts.append(f"{nm} rotating over")
-        else:
-            parts.append(nm)
+        parts.append(f"{nm} rotating over" if d.get("rotating_over") else nm)
     return ", ".join(parts)
 
 def _possession_has_help_text(pbp_text: str) -> bool:
-    """Lightweight flag so downstream UI can highlight 'shot out of help' if needed."""
     t = _clean_frag(pbp_text or "")
     return bool(_HELP_LINE_RE.search(t))
 
 def extract_roles_for_shot(pbp_text: str, shot_index: int):
-    """Return (shooter, onball_def, assister, screen_assists[list], candidate_action_lines[])"""
+    """
+    Return tuple:
+      (shooter, onball_def, assister, screen_assists[list], candidate_action_lines[list])
+    """
     line = _nth_shot_line(pbp_text or "", shot_index)
     shooter, onball_def = _first_guard_pair(line)
     if not shooter:
         shooter = _guess_shooter_from_make_miss(line)
 
-    # --- NEW: upgrade on-ball defender to support multi-defenders and 'rotating over'
     defenders = _parse_defenders_with_tags_from_line(line)
     if defenders:
         onball_def = _format_defenders_for_display(defenders)
@@ -884,33 +792,25 @@ def extract_roles_for_shot(pbp_text: str, shot_index: int):
     assister = _parse_assister(pbp_text or "", prefer_line=line)
     screen_ast_list = _parse_screen_assister(pbp_text or "", prefer_line=line)
 
-    # include lines that plausibly contain actions OR coverage cues
     candidates = []
     for ln in (pbp_text or "").splitlines():
         lcl = ln.lower()
         if any(k in lcl for k in [
-            # on-ball phrases
             "pick and roll","pick and pop","dribble hand","hands off","hand off","handoff",
             "slip","ghost","reject","bring","drive",
-            "post up","posting up","posts up",   # <-- added posts up
+            "post up","posting up","posts up",
             "keep the handoff","handoff keep",
             "rescreen","re-screen",
-            # off-ball phrases:
             "backdoor","backdoor cut","pin down","pindown","flare screen","back screen","away screen", "hammer screen", "ucla screen",
             "cross screen","wedge screen","rip screen","stagger screen","stagger screens","iverson screen",
             "elevator screen","elevator screens",
-            # coverage-only cues (include common inflections!)
             "switch", "switches", "switched", "switching",
             "chase over", "chases over",
             "cut under", "cuts under",
             "caught on screen", "top lock", "ice", "blitz",
-            # help-defense cues (still candidates, but no separate “Out of help” block)
             "help", "steps in to help"
         ]):
             candidates.append(ln.strip())
-
-    # (Optional downstream use) You can also check _possession_has_help_text(pbp_text)
-    # to tag "shots out of help" in your UI if you’d like.
 
     return shooter, onball_def, assister, screen_ast_list, candidates
 
@@ -925,16 +825,14 @@ _DHO_RE = re.compile(
 )
 _HO_RE  = re.compile(r"\bhand(?:s)?\s*off\s+to\b|\bhand-?off\s+to\b|\bhandoff\s+to\b", re.IGNORECASE)
 _KP_RE  = re.compile(r"\bkeep[s]?\s+the\s+hand[\s-]?off\b|\bhandoff\s+keep\b", re.IGNORECASE)
-
-# NEW: rescreen detector
 _RESCR_RE = re.compile(r"\brescreen(?:s|ed|ing)?\b|\bre\-screen(?:s|ed|ing)?\b", re.IGNORECASE)
 
-_COV_CH = re.compile(r"\bchas(?:e|es|ed|ing)\s+over\b", re.IGNORECASE)        # ch
-_COV_CT = re.compile(r"\bcut(?:s|ting)?\s+(?:under|below|around)\b", re.IGNORECASE)  # ct
-_COV_SW = re.compile(r"\bswitch(?:es|ed|ing)?\b(?:\s+(?:onto|on)\s+({_FULLNAME}))?", re.IGNORECASE)  # sw
-_COV_BZ = re.compile(r"\bblitz(?:es|ed|ing)?\b", re.IGNORECASE)               # bz
-_COV_CS = re.compile(r"\bcaught\s+on\s+screen\b", re.IGNORECASE)              # cs
-_COV_TL = re.compile(r"\btop\s+lock(?:s|ed|ing)?\b", re.IGNORECASE)           # tl
+_COV_CH = re.compile(r"\bchas(?:e|es|ed|ing)\s+over\b", re.IGNORECASE)
+_COV_CT = re.compile(r"\bcut(?:s|ting)?\s+(?:under|below|around)\b", re.IGNORECASE)
+_COV_SW = re.compile(r"\bswitch(?:es|ed|ing)?\b(?:\s+(?:onto|on)\s+({_FULLNAME}))?", re.IGNORECASE)
+_COV_BZ = re.compile(r"\bblitz(?:es|ed|ing)?\b", re.IGNORECASE)
+_COV_CS = re.compile(r"\bcaught\s+on\s+screen\b", re.IGNORECASE)
+_COV_TL = re.compile(r"\btop\s+lock(?:s|ed|ing)?\b", re.IGNORECASE)
 _COV_ICE = re.compile(r"\bice(?:s|d|ing)?\b", re.IGNORECASE)
 
 def _parse_coverages(line: str):
@@ -953,7 +851,6 @@ def _parse_coverages(line: str):
         out.append({"cov":"sw", "label":"Switch", "onto": _normalize_to_roster(who)})
     return out
 
-# ---- helper: all guarded-by pairs in a line, in order (BH/def first, then any screeners/defs)
 def _all_guard_pairs_in_line(line: str):
     out = []
     for m in re.finditer(_SHOOT_GUARD_RE, _clean_frag(line)):
@@ -980,14 +877,13 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
         lc = ln.lower()
         added_action = False
         covs_line = _parse_coverages(ln)
-        is_shot_ln = _is_shot_line(ln)  # <-- NEW: tag whether this specific line is the shot line
+        is_shot_ln = _is_shot_line(ln)
 
         first_a, first_b = _first_guard_pair(ln)
         from_a, from_b = _from_pair(ln)
         to_a,   to_b   = _to_pair(ln)
         for_a,  for_b  = _for_pair(ln)
 
-        # gather ALL guarded-by pairs on the line (BH first, then screeners)
         guard_pairs = _all_guard_pairs_in_line(ln)
 
         if _KP_RE.search(lc):
@@ -995,7 +891,7 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "keeper": first_a, "keeper_def": first_b,
                  "intended": (for_a or to_a), "intended_def": (for_b or to_b),
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
             actions.append(d); _remember(d); added_action = True
 
         elif _DHO_RE.search(lc):
@@ -1003,7 +899,7 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "giver": first_a, "giver_def": first_b,
                  "receiver": to_a, "receiver_def": to_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
             actions.append(d); _remember(d); added_action = True
 
         elif _HO_RE.search(lc):
@@ -1011,7 +907,7 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "giver": first_a, "giver_def": first_b,
                  "receiver": to_a, "receiver_def": to_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
             actions.append(d); _remember(d); added_action = True
 
         elif "pick and roll" in lc:
@@ -1021,13 +917,11 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                 "screener": from_a, "screener_def": from_b,
                 "screen_assist": (screen_ast_in_possession or ""),
                 "coverages": covs_line,
-                "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)  # NEW
+                "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)
             }
-            # NEW: support multiple screeners by using all guarded pairs after BH/def
             if guard_pairs and len(guard_pairs) > 1:
                 scr_pairs = guard_pairs[1:]
                 d["screeners"] = [{"name": a, "def": b} for (a,b) in scr_pairs]
-                # keep single fields for back-compat (first screener)
                 d["screener"], d["screener_def"] = scr_pairs[0]
             actions.append(d); _remember(d); added_action = True
 
@@ -1038,7 +932,7 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                 "screener": from_a, "screener_def": from_b,
                 "screen_assist": (screen_ast_in_possession or ""),
                 "coverages": covs_line,
-                "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)  # NEW
+                "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)
             }
             if guard_pairs and len(guard_pairs) > 1:
                 scr_pairs = guard_pairs[1:]
@@ -1053,10 +947,10 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "bh": bh, "bh_def": bh_def,
                  "screener": scr, "screener_def": scr_def,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
             actions.append(d); _remember(d); added_action = True
 
-        elif _SLIP_RE.search(lc) or _GHOST_RE.search(lc) or _REJECT_RE.search(lc):
+        elif re.search(r"\bslip(?:s|ped|ping)?\b", lc) or re.search(r"\bghost(?:s|ed|ing)?", lc) or re.search(r"\breject(?:s|ed|ing)?\b", lc):
             label = "Slip" if _SLIP_RE.search(lc) else ("Ghost" if _GHOST_RE.search(lc) else "Reject")
             bh, bh_def = "", ""
             scr, scr_def = "", ""
@@ -1079,25 +973,25 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "label":label, "bh":bh, "bh_def":bh_def,
                  "screener":scr, "screener_def":scr_def,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
             actions.append(d); _remember(d); added_action = True
 
         elif re.search(r"bring[s]?\s+.*over\s+half\s*court", lc):
             d = {"type":"h","label":"Bring over halfcourt","bh":first_a,"bh_def":first_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
             actions.append(d); _remember(d); added_action = True
 
         elif re.search(r"\bdriv(?:e|es|ing)\b", lc):
             d = {"type":"d","label":"Drive","bh":first_a,"bh_def":first_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
             actions.append(d); _remember(d); added_action = True
 
         elif re.search(r"\bpost(?:s)?\s+up\b|\bposting\s+up\b", lc):
             d = {"type":"p","label":"Post up","bh":first_a,"bh_def":first_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
             actions.append(d); _remember(d); added_action = True
 
         # if this line had only coverage, attach to the most recent action
@@ -1112,15 +1006,10 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
 
     return actions
 
-
-# ========================= NEW (mk12-rtg): Ratings & +/- declarations + helpers =========================
-# These are *additive* declarations usable by later sections when aggregating player rows.
-
-# Per-player rating/score keys we will populate later:
+# ========================= Ratings & +/- helpers =========================
 RATING_STATS_KEYS = ["PF", "PA", "ORtg", "DRtg", "NET", "+/-"]
 
 def _div0(n, d, default=0.0):
-    """Safe divide with graceful zero/invalid handling."""
     try:
         d = float(d)
         return float(n) / d if d != 0 else default
@@ -1128,36 +1017,24 @@ def _div0(n, d, default=0.0):
         return default
 
 def calc_off_rating(pf, op):
-    """ORtg = 100 * (Points For / Offensive Possessions)"""
     return 100.0 * _div0(pf, op, 0.0)
 
 def calc_def_rating(pa, dp):
-    """DRtg = 100 * (Points Against / Defensive Possessions)"""
     return 100.0 * _div0(pa, dp, 0.0)
 
 def calc_net_rating(ortg, drtg):
-    """NET = ORtg - DRtg"""
     try:
         return float(ortg) - float(drtg)
     except Exception:
         return 0.0
 
 def calc_plus_minus(pf, pa):
-    """+/- = PF - PA"""
     try:
         return float(pf) - float(pa)
     except Exception:
         return 0.0
 
 def compute_ratings_for_row(row: dict) -> dict:
-    """
-    Fill ORtg, DRtg, NET, +/- on a per-player row *in place* using:
-      - PF (points for)
-      - PA (points against)
-      - OP (offensive possessions)
-      - DP (defensive possessions)
-    Any missing inputs are treated as 0.
-    """
     if not isinstance(row, dict):
         return row
     pf = row.get("PF", 0)
@@ -1169,7 +1046,8 @@ def compute_ratings_for_row(row: dict) -> dict:
     row["NET"]  = calc_net_rating(row["ORtg"], row["DRtg"])
     row["+/-"]  = calc_plus_minus(pf, pa)
     return row
-# ========================= END (mk12-rtg) =========================
+# ========================= END SECTION 1 ======================================
+
 
 
 
