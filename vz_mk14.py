@@ -4539,7 +4539,7 @@ def _rows_full():
     """Rows with rich fields for Shooting tab visuals (1 row per logged possession)."""
     rows_for_plot = []
 
-    # Load using URL/file-aware cache (handles HTTP and local files)
+    # Load using URL/file-aware cache
     data = safe_load_data()
     if not data:
         return rows_for_plot
@@ -4547,7 +4547,7 @@ def _rows_full():
         data = data.get("rows", []) or []
 
     for rr in (data or []):
-        # --- coords / result ---
+        # xy + result
         try:
             x = float(rr.get("x")) if str(rr.get("x")).strip() not in ("", "None") else None
             y = float(rr.get("y")) if str(rr.get("y")).strip() not in ("", "None") else None
@@ -4565,7 +4565,6 @@ def _rows_full():
 
         idx = rr.get("shot_index") or 1
 
-        # --- roles / defenders from PBP ---
         shooter_p, onball_def_p, assister_p, screen_ast_list_p, action_lines = extract_roles_for_shot(pbp_src_for_roles, idx)
         _def_disp_from_shot_line = shot_defender_display(pbp_src_for_roles, idx)
         if _def_disp_from_shot_line:
@@ -4587,7 +4586,6 @@ def _rows_full():
         on_types_connected  = _onball_codes_connected_to_shot(short)
         off_types_connected = _offball_codes_connected_to_shot(short)
 
-        # pnp inference
         try:
             shooter_name  = _force_to_roster_name(shooter_raw).lower()
             assister_name = _force_to_roster_name(assister_raw).lower()
@@ -4604,7 +4602,6 @@ def _rows_full():
 
         off_players, def_players = _participants_clean(pbp_src_for_roles, short)
 
-        # defense label
         try:
             def_label = defense_label_for_shot(pbp_src_for_roles, idx) or "Man to Man"
         except Exception:
@@ -4720,7 +4717,6 @@ def _rows_stats_all():
             "screen_assisters_raw": screen_ast_list_raw,
         })
     return rows_for_stats
-
 
 
 def _uniq_sorted(seq):
