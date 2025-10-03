@@ -16,13 +16,26 @@ import plotly.graph_objects as go
 # =========================
 # Config
 # =========================
-DATA_PATH = os.environ.get("BBALL_DATA", "data/possessions.json")
+import os
 
-# NEW: match the entry app’s roster location scheme
-BASE_DIR    = os.path.dirname(DATA_PATH) or "."
+# Use the same absolute data directory as the entry app
+DATA_DIR = r"C:\Users\jerem\OneDrive\Documents\Basketball\2025-2026\data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Possessions log (viz reads this)
+DATA_PATH = os.environ.get("BBALL_DATA", os.path.join(DATA_DIR, "possessions.json"))
+
+# Match the entry app’s roster/practices location
+BASE_DIR = os.path.dirname(DATA_PATH) or DATA_DIR
 ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
-# --- NEW: practices metadata (written by sc_mark_6 when starting a practice)
 PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
+
+# Debug: confirm viz is reading the right files
+print("VIZ USING DATA FILES:")
+print("  Possessions JSON :", DATA_PATH)
+print("  Roster           :", ROSTER_PATH)
+print("  Practices        :", PRACTICES_PATH)
+
 
 # Court geometry (must match entry app exactly)
 COURT_W = 50.0
@@ -3078,7 +3091,7 @@ def create_shot_chart(shots, highlight_coords=None):
 
     if makes:
         x, y = zip(*makes)
-        fig.add_trace(go.Scatter(
+        fig.add_trace(go.Scattergl(
             x=x, y=y, mode='markers',
             marker=dict(symbol='circle', size=10, color='green', line=dict(width=1, color='green')),
             hovertemplate="Make<extra></extra>",
@@ -3086,7 +3099,7 @@ def create_shot_chart(shots, highlight_coords=None):
         ))
     if misses:
         x, y = zip(*misses)
-        fig.add_trace(go.Scatter(
+        fig.add_trace(go.Scattergl(
             x=x, y=y, mode='markers',
             marker=dict(symbol='x', size=10, color='red'),
             hovertemplate="Miss<extra></extra>",

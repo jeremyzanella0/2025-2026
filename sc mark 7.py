@@ -21,22 +21,39 @@ from dash.dependencies import ALL
 import plotly.graph_objects as go
 
 # =========================
+# =========================
 # Config
 # =========================
-DATA_PATH  = os.environ.get("BBALL_DATA", "data/possessions.json")
-APP_TITLE  = "CWB Practice Data Entry"
-os.makedirs(os.path.dirname(DATA_PATH) or ".", exist_ok=True)
+import os
 
-BASE_DIR    = os.path.dirname(DATA_PATH) or "."
+# Use an absolute data directory so files always land in the same place
+DATA_DIR = r"C:\Users\jerem\OneDrive\Documents\Basketball\2025-2026\data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Main possession log paths
+DATA_PATH = os.environ.get("BBALL_DATA", os.path.join(DATA_DIR, "possessions.json"))
+DATA_PATH_JSONL = os.environ.get("BBALL_DATA_JSONL", os.path.join(DATA_DIR, "possessions.jsonl"))
+
+# App title
+APP_TITLE = "CWB Practice Data Entry"
+
+# Base dir for related files
+BASE_DIR = os.path.dirname(DATA_PATH) or DATA_DIR
+
+# Roster and practices metadata
 ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
-# --- NEW: practices metadata (absences) persisted next to possessions/roster
 PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
 
-# --- NEW: Append-only JSONL path (for scalable, O(1) writes)
-DATA_PATH_JSONL = os.environ.get("BBALL_DATA_JSONL", os.path.join(BASE_DIR, "possessions.jsonl"))
+# Limit how many rows we keep in client store (browser memory)
+MAX_CLIENT_ROWS = int(os.environ.get("MAX_CLIENT_ROWS", "50000"))
 
-# --- NEW: Limit how many rows we keep in the client store (browser memory)
-MAX_CLIENT_ROWS = int(os.environ.get("MAX_CLIENT_ROWS", "2000"))
+# Debug: print what files are being used
+print("USING DATA FILES:")
+print("  Possessions JSON :", DATA_PATH)
+print("  Possessions JSONL:", DATA_PATH_JSONL)
+print("  Roster           :", ROSTER_PATH)
+print("  Practices        :", PRACTICES_PATH)
+
 
 # =========================
 # Optional parser module
@@ -726,7 +743,7 @@ def make_click_dots():
             xs.append(x); ys.append(y)
             y += 0.5
         x += 0.5
-    return go.Scatter(
+    return go.Scattergl(
         x=xs, y=ys, mode='markers',
         marker=dict(size=5, color='red', opacity=0.6),
         showlegend=False,
