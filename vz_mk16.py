@@ -1,318 +1,28 @@
 # ------------------SECTION 1--------------------------------------------------
+
 # vz_mk5 — adds shooting stats and stats table, adds filters
 
-import os, json, math, re, logging
+import os
+import json
+import math
+import re
 import numpy as np
 import dash
-from dash import Dash, html, dcc, Output, Input, State, no_update, callback_context, ALL
+from dash import html, dcc, Output, Input, State, no_update
+from dash import callback_context
+from dash import ALL
 import plotly.graph_objects as go
-from flask import Response
-import requests  # allow URL data sources
-
-log = logging.getLogger(__name__)
 
 # =========================
-# Resolve absolute data paths from THIS file (works on Windows + Linux)
-# Also supports HTTP(S) URLs via env vars.
+# Config
 # =========================
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.environ.get("BBALL_DATA", "data/possessions.json")
 
-def _is_url(s: str) -> bool:
-    return isinstance(s, str) and s.lower().startswith(("http://", "https://"))
-
-def _abs_from_app(path_like: str) -> str:
-    """
-    If path_like is a URL, return as-is.
-    If it's empty/None, return empty string.
-    Otherwise make it absolute relative to this file.
-    """
-    if not path_like:
-        return ""
-    if _is_url(path_like):
-        return path_like
-    return path_like if os.path.isabs(path_like) else os.path.normpath(os.path.join(APP_DIR, path_like))
-
-def _resolve_data_src(env_key: str, default_rel: str) -> str:
-    """
-    Resolve a source from env var or fallback to a repo-relative file path.
-    Handles URLs correctly.
-    """
-    return _abs_from_app(os.environ.get(env_key, default_rel))
-
-# Allow overriding all three via env vars
-DATA_PATH       = _resolve_data_src("BBALL_DATA",       "data/possessions.json")
-ROSTER_PATH     = _resolve_data_src("BBALL_ROSTER",     "data/roster.json")
-PRACTICES_PATH  = _resolve_data_src("BBALL_PRACTICES",  "data/practices.json")
-
-# --- DATA LOADER UTILITIES ----------------------------------------------------
-
-def _load_json_any(src):
-    """
-    Load JSON from a local file path or HTTP(S) URL.
-    Returns the parsed JSON (list or dict). Raises on errors.
-    """
-    if _is_url(src):
-        r = requests.get(src, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    with open(src, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def _count_json(src) -> int:
-    try:
-        j = _load_json_any(src)
-        if isinstance(j, list):  return len(j)
-        if isinstance(j, dict):  return len(j)
-        return -1
-    except Exception as e:
-        print(f"[count_json] {src}: {e}")
-        return -1
-
-def _first_row_keys(src):
-    try:
-        j = _load_json_any(src)
-        if isinstance(j, list) and j and isinstance(j[0], dict):
-            return set(j[0].keys())
-    except Exception as e:
-        print(f"[first_row_keys] {src}: {e}")
-    return set()
-
-def _schema_keys(src, k=10):
-    try:
-        j = _load_json_any(src)
-        if isinstance(j, list) and j and isinstance(j[0], dict):
-            return list(j[0].keys())[:k]
-    except Exception as e:
-        print(f"[schema_keys] {src}: {e}")
-    return []
-
-# -------- Single, canonical possessions loader (replaces duplicate safe_load_data) -----
-_CACHED_ROWS = []
-_DATA_LAST_MTIME = None  # local files only
-
-def load_possessions_cached(src=DATA_PATH, use_cache=True):
-    """
-    Load possessions as a list[dict].
-    - Local file: cache by mtime.
-    - URL: no mtime; light cache if use_cache=True (keeps last good).
-    Returns [] on failure.
-    """
-    global _CACHED_ROWS, _DATA_LAST_MTIME
-
-    # URL source: just try to fetch; if it fails, fall back to cache.
-    if _is_url(src):
-        if not use_cache:
-            try:
-                j = _load_json_any(src)
-                rows = j.get("rows", j) if isinstance(j, dict) else j
-                rows = [r for r in (rows or []) if isinstance(r, dict)]
-                _CACHED_ROWS = rows
-                return list(rows)
-            except Exception as e:
-                print(f"[load_possessions_cached][URL fresh] {e}")
-                return list(_CACHED_ROWS)
-        # cached path
-        try:
-            j = _load_json_any(src)
-            rows = j.get("rows", j) if isinstance(j, dict) else j
-            rows = [r for r in (rows or []) if isinstance(r, dict)]
-            _CACHED_ROWS = rows
-            return list(rows)
-        except Exception as e:
-            print(f"[load_possessions_cached][URL cached] {e}")
-            return list(_CACHED_ROWS)
-
-    # Local file path
-    if not os.path.exists(src):
-        return list(_CACHED_ROWS)
-    try:
-        mtime = os.path.getmtime(src)
-    except Exception:
-        return list(_CACHED_ROWS)
-
-    if use_cache and _DATA_LAST_MTIME == mtime and _CACHED_ROWS:
-        return list(_CACHED_ROWS)
-
-    try:
-        j = _load_json_any(src)
-        rows = j.get("rows", j) if isinstance(j, dict) else j
-        rows = [r for r in (rows or []) if isinstance(r, dict)]
-        _CACHED_ROWS = rows
-        _DATA_LAST_MTIME = mtime
-        return list(rows)
-    except Exception as e:
-        print(f"[load_possessions_cached][local] {e}")
-        return list(_CACHED_ROWS)
-
-def _peek_json(src, limit=2):
-    try:
-        data = load_possessions_cached(src, use_cache=False)
-    except Exception as e:
-        print(f"[PEEK] failed to load {src}: {e}")
-        return
-    keys_union = set()
-    for r in data[:limit]:
-        if isinstance(r, dict):
-            keys_union.update(r.keys())
-    print("=== DATA DIAGNOSTIC ===")
-    print(f"[SRC] {src}")
-    if _is_url(src):
-        try:
-            h = requests.head(src, timeout=5)
-            clen = h.headers.get("Content-Length", "?")
-            print(f"[URL] status={h.status_code} content-length={clen}")
-        except Exception as e:
-            print(f"[URL] HEAD failed: {e}")
-    else:
-        print(f"[EXISTS] {os.path.exists(src)} size={os.path.getsize(src) if os.path.exists(src) else 0}")
-    print(f"[COUNT] {len(data)}")
-    print(f"[SAMPLE KEYS] {sorted(list(keys_union))}")
-    print("=======================")
-
-def _parse_probe(src):
-    """Print the raw fields the parser relies on for the first possession."""
-    print("=== PARSE PROBE (first possession) ===")
-    try:
-        rows = load_possessions_cached(src, use_cache=False)
-        if not rows:
-            print("[PARSE PROBE] No possessions loaded or wrong format.")
-        else:
-            row0 = rows[0]
-            print("[PBP]", row0.get("play_by_play"))
-            print("[PBP_NAMES]", row0.get("play_by_play_names"))
-            print("[POSSESSION]", row0.get("possession"))
-            print("[SHORTHAND]", row0.get("shorthand"))
-            print("[POSSESSION_TYPE]", row0.get("possession_type"))
-    except Exception as e:
-        print("[PARSE PROBE ERROR]", e)
-    print("======================================")
-
-
-# --- Back-compat loader alias (so older code calling safe_load_data keeps working) ---
-def safe_load_data(path_like: str | None = None):
-    """
-    Back-compat wrapper around load_possessions_cached.
-    Returns a list[dict] of possession rows.
-    Accepts optional path; defaults to DATA_PATH.
-    """
-    src = path_like if path_like else DATA_PATH
-    return load_possessions_cached(src, use_cache=True)
-
-
-# --- DIAGNOSTICS @ IMPORT -----------------------------------------------------
-print("=== Startup data check ===")
-for src in (DATA_PATH, ROSTER_PATH, PRACTICES_PATH):
-    try:
-        if _is_url(src):
-            try:
-                h = requests.head(src, timeout=5)
-                clen = h.headers.get("Content-Length", "?")
-                print(f"{src} [URL] status={h.status_code} content-length={clen}")
-            except Exception as e:
-                print(f"{src} [URL HEAD error] {e}")
-        else:
-            print(f"{src} exists={os.path.exists(src)} size={os.path.getsize(src) if os.path.exists(src) else 0}")
-    except Exception as _e:
-        print(f"{src} exists=? size=? err={_e}")
-print(f"[COUNTS] possessions={_count_json(DATA_PATH)}, roster={_count_json(ROSTER_PATH)}, practices={_count_json(PRACTICES_PATH)}")
-print(f"[SCHEMA] poss keys: {sorted(list(_first_row_keys(DATA_PATH)))[:20]}")
-_peek_json(DATA_PATH)
-_parse_probe(DATA_PATH)
-print("================================")
-
-# Optional status string you can render under the H1
-STATUS_TEXT = (
-    f"Data source: {DATA_PATH}  •  rows={_count_json(DATA_PATH)}  "
-    f"•  sample keys: {', '.join(_schema_keys(DATA_PATH, k=8)) or 'unknown'}"
-)
-
-# =========================
-# App (title + expose Flask server)
-# =========================
-app = Dash(
-    __name__,
-    title="CWB Practice Stats",
-    suppress_callback_exceptions=True,
-    serve_locally=True,   # serve component bundles from this app (not CDN)
-)
-server = app.server
-
-# tiny health check so we know the Flask layer is alive
-@server.route("/healthz")
-def _healthz():
-    return Response("ok", mimetype="text/plain")
-
-# ---------------- DEBUG: inspect parser on the first possession ----------------
-@server.route("/debug/first-possession")
-def _debug_first_possession():
-    try:
-        rows = load_possessions_cached(DATA_PATH, use_cache=True)
-        first = rows[0] if rows else {}
-        pbp_names = (first.get("play_by_play_names") or "").strip()
-        pbp_raw   = (first.get("play_by_play") or "").strip()
-        poss      = (first.get("possession") or "").strip()
-        idx       = first.get("shot_index") or 1
-
-        # Choose best available source text for parsing (THIS is the key fix)
-        pbp_src = pbp_names or pbp_raw or poss or (first.get("shorthand") or "")
-
-        shooter = onball_def = assister = ""
-        screen_asts = []
-        candidates = []
-
-        try:
-            parsed_tuple = extract_roles_for_shot(pbp_src, idx)  # defined below
-            # Expected: (shooter, onball_def, assister, screen_ast_list, candidates)
-            if isinstance(parsed_tuple, (list, tuple)) and len(parsed_tuple) >= 5:
-                shooter, onball_def, assister, screen_asts, candidates = parsed_tuple[:5]
-            else:
-                candidates = [f"Unexpected parse return: {type(parsed_tuple)}"]
-        except Exception as e:
-            candidates = [f"extract_roles_for_shot error: {e}"]
-
-        payload = {
-            "pbp_names": pbp_names,
-            "pbp_raw": pbp_raw,
-            "possession": poss,
-            "shot_index": idx,
-            "parsed": {
-                "shooter": shooter,
-                "onball_defender": onball_def,
-                "assister": assister,
-                "screen_assists": screen_asts,
-                "candidates": candidates,
-            },
-        }
-        return Response(json.dumps(payload, indent=2), mimetype="application/json")
-    except Exception as e:
-        return Response(json.dumps({"error": str(e)}), mimetype="application/json", status=500)
-
-# =========================
-# Layout wiring (use the REAL layout, fail gracefully)
-# =========================
-def _safe_serve_layout():
-    """
-    Use the full UI builder (serve_layout) but never let an import-time error
-    blank the page in production. If something fails, show a readable fallback.
-    """
-    try:
-        return serve_layout()  # <-- your real layout function defined later
-    except Exception:
-        import traceback
-        log.exception("serve_layout failed during app start")
-        return html.Div(
-            [
-                html.H1("CWB Practice Stats"),
-                html.Div("The main layout failed to load. Check server logs for details."),
-                html.Pre(STATUS_TEXT),
-                html.Pre(traceback.format_exc() ),
-            ],
-            style={"padding": "2rem", "fontFamily": "system-ui, Arial, sans-serif"},
-        )
-
-# IMPORTANT: point Dash at the safe, real layout (replaces any build_layout)
-app.layout = _safe_serve_layout
-
+# NEW: match the entry app’s roster location scheme
+BASE_DIR    = os.path.dirname(DATA_PATH) or "."
+ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
+# --- NEW: practices metadata (written by sc_mark_6 when starting a practice)
+PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
 
 # Court geometry (must match entry app exactly)
 COURT_W = 50.0
@@ -327,9 +37,12 @@ LANE_X0, LANE_X1 = RIM_X - LANE_W/2.0, RIM_X + LANE_W/2.0
 THREE_R, SIDELINE_INSET = 22.15, 3.0
 LEFT_POST_X, RIGHT_POST_X = SIDELINE_INSET, COURT_W - SIDELINE_INSET
 
-# Global cache used by loader above
-# (kept near geometry so later sections can import if needed)
-# _CACHED_ROWS, _DATA_LAST_MTIME already declared above
+# Global cache
+CACHED_DATA = []
+
+# NEW (mk5 perf): also cache by file modified time to avoid needless re-parses
+_DATA_LAST_MTIME = 0.0
+_CACHED_DATA_BY_MTIME = []  # same content as CACHED_DATA but keyed by mtime
 
 def result_from_shorthand(s: str):
     if not s:
@@ -354,6 +67,53 @@ def rows_to_shots(rows):
             continue
     return shots
 
+def safe_load_data():
+    """Load and cache the *raw possession rows* with caching on failure.
+
+    mk5 improvement:
+      - Only re-parse when the DATA_PATH's mtime changes.
+      - If file is missing or mid-write/corrupt, return last good cache.
+      - IMPORTANT: returns the original possession ROWS (dicts), not {x,y,result} shots.
+      - FIX: always return a shallow copy so Dash callbacks see a new object and recompute stats.
+    """
+    global CACHED_DATA, _DATA_LAST_MTIME, _CACHED_DATA_BY_MTIME
+
+    # If the file doesn't exist, keep serving whatever we had last.
+    if not os.path.exists(DATA_PATH):
+        return list(_CACHED_DATA_BY_MTIME or CACHED_DATA)
+
+    try:
+        mtime = os.path.getmtime(DATA_PATH)
+    except Exception:
+        # If we can't stat it, keep the last known good.
+        return list(_CACHED_DATA_BY_MTIME or CACHED_DATA)
+
+    # If file hasn't changed, return the mtime-cached parse (super fast).
+    if mtime == _DATA_LAST_MTIME and _CACHED_DATA_BY_MTIME:
+        # return a shallow copy to trigger downstream recompute without reparsing
+        return list(_CACHED_DATA_BY_MTIME)
+
+    # Otherwise, try to (re)load and parse
+    try:
+        with open(DATA_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Support both {"rows":[...]} and [...] shapes
+        rows = data.get("rows", data) if isinstance(data, dict) else (data or [])
+        # Ensure it's a list[dict]
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+
+        # update both caches on success
+        CACHED_DATA = rows
+        _CACHED_DATA_BY_MTIME = rows
+        _DATA_LAST_MTIME = mtime
+        # return a shallow copy so Dash callbacks see a new object
+        return list(rows)
+
+    except Exception:
+        # If load/parse fails (e.g., mid-write), return last good cache
+        return list(_CACHED_DATA_BY_MTIME or CACHED_DATA)
+
 # ------------------------- Roster loading (same as entry app) -------------------------
 
 def _load_roster_from_disk():
@@ -362,23 +122,19 @@ def _load_roster_from_disk():
     Returns dict like {"12": "Joleen Lusk", "21": "Adrianna Fontana", ...}
     """
     try:
-        if _is_url(ROSTER_PATH):
-            raw = _load_json_any(ROSTER_PATH) or {}
-        elif os.path.exists(ROSTER_PATH):
+        if os.path.exists(ROSTER_PATH):
             with open(ROSTER_PATH, "r", encoding="utf-8") as f:
                 raw = json.load(f) or {}
-        else:
-            return {}
-        out = {}
-        for k, v in (raw or {}).items():
-            try:
-                kk = str(int(k))  # jersey numbers as strings
-                name = (v or "").strip()
-                if name:
-                    out[kk] = name
-            except:
-                continue
-        return out
+            out = {}
+            for k, v in raw.items():
+                try:
+                    kk = str(int(k))  # jersey numbers as strings
+                    name = (v or "").strip()
+                    if name:
+                        out[kk] = name
+                except:
+                    continue
+            return out
     except Exception as e:
         print(f"[roster load] {e}")
     return {}
@@ -470,13 +226,14 @@ def _normalize_list(names):
             seen.add(key)
     return out
 
-# ---- jersey helpers / turnover parsing (kept from prior version) -------------
+# ---- NEW (zero-shot support): jersey → name and shorthand turnover parsing ----
 _JNUM_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)")
 _LBTO_RE = re.compile(r"\blbto\b", re.IGNORECASE)
 _DBTO_RE = re.compile(r"\bdbto\b", re.IGNORECASE)
 _STL_RE  = re.compile(r"\bstl(\d{1,2})\b", re.IGNORECASE)
 
 def roster_name_from_jersey(jersey: str, roster_dict: dict | None = None) -> str:
+    """Map a jersey string (e.g. '20') to the full roster name, if present."""
     roster = roster_dict or _get_roster_cache()
     try:
         j = str(int(str(jersey).strip()))
@@ -485,12 +242,25 @@ def roster_name_from_jersey(jersey: str, roster_dict: dict | None = None) -> str
         return ""
 
 def parse_onball_pair_from_shorthand(s: str) -> tuple[str, str]:
+    """
+    Return ('offense_jersey','defense_jersey') from the leading 'A/B' shorthand
+    (e.g., '1/20 lbto' -> ('1','20')). Returns ('','') if not present.
+    """
     m = _JNUM_RE.search(s or "")
     if not m:
         return ("","")
     return (m.group(1), m.group(2))
 
 def parse_turnover_tokens(s: str) -> dict:
+    """
+    Inspect a shorthand blob and report turnover/steal tokens.
+    Returns:
+      {
+        "lbto": True/False,
+        "dbto": True/False,
+        "steal_jersey": "11" | ""      # from 'stl11' if present
+      }
+    """
     t = s or ""
     return {
         "lbto": bool(_LBTO_RE.search(t)),
@@ -499,31 +269,57 @@ def parse_turnover_tokens(s: str) -> dict:
     }
 
 def is_zero_shot_possession(row: dict) -> bool:
+    """
+    True when a possession has no '+'/'++'/'-' result token (no shot) but
+    includes a turnover token like lbto/dbto.
+    """
     poss = (row or {}).get("possession", "") or ""
     return (result_from_shorthand(poss) is None) and (_LBTO_RE.search(poss) or _DBTO_RE.search(poss))
 
 def extract_zero_shot_events(row: dict, roster_dict: dict | None = None) -> dict:
+    """
+    For possessions without a shot, extract who turned it over and who stole it.
+    Returns (empty names when not inferable):
+      {
+        "turnover_by": "Full Name" | "",
+        "turnover_type": "LBTO" | "DBTO" | "",
+        "steal_by": "Full Name" | ""
+      }
+    Logic:
+      - Offense/defense jerseys are taken from the leading 'A/B' token.
+      - If 'lbto' or 'dbto' present, turnover_by is the offense jersey.
+      - If 'stl##' present, that jersey is credited with a steal.
+    """
     roster = roster_dict or _get_roster_cache()
     poss = (row or {}).get("possession", "") or ""
-    off_j, _def_j = parse_onball_pair_from_shorthand(poss)
+    off_j, def_j = parse_onball_pair_from_shorthand(poss)
     toks = parse_turnover_tokens(poss)
+
     to_type = "LBTO" if toks.get("lbto") else ("DBTO" if toks.get("dbto") else "")
     to_by = roster_name_from_jersey(off_j, roster)
     stl_by = roster_name_from_jersey(toks.get("steal_jersey",""), roster)
+
     return {
         "turnover_by": to_by if to_type else "",
         "turnover_type": to_type,
         "steal_by": stl_by
     }
+# ---- END (zero-shot support) -------------------------------------------------
 
-# --- practices meta loader (unchanged) ---------------------------------------
+# --- NEW: practices meta loader + date helpers + PRAC computation -------------
+
 def load_practices_meta(path=PRACTICES_PATH):
-    if _is_url(path):
-        try:
-            return _load_json_any(path) or {}
-        except Exception as e:
-            print(f"[practices load URL] {e}")
-            return {}
+    """
+    Load practices metadata written by the entry app when a practice starts:
+      {
+        "practice-YYYY-MM-DD": {
+          "practice_date": "YYYY-MM-DD",
+          "absent_numbers": ["12","23", ...]
+        },
+        ...
+      }
+    Returns {} if file missing or unreadable.
+    """
     if not os.path.exists(path):
         return {}
     try:
@@ -535,6 +331,8 @@ def load_practices_meta(path=PRACTICES_PATH):
         return {}
 
 def _norm_date_yyyy_mm_dd(s):
+    """Accept 'YYYY-MM-DD' or 'MM/DD/YYYY' and return 'YYYY-MM-DD' or None."""
+    # FIX: ensure datetime is available inside this helper
     from datetime import datetime
     if not s:
         return None
@@ -550,6 +348,7 @@ def _norm_date_yyyy_mm_dd(s):
         return None
 
 def _date_in_range(d, start_d, end_d):
+    """All args are 'YYYY-MM-DD' or None. Inclusive if bounds provided."""
     if not d:
         return False
     if start_d and d < start_d:
@@ -559,7 +358,13 @@ def _date_in_range(d, start_d, end_d):
     return True
 
 def compute_practices_played_counts(roster_map, practices_meta, start_date=None, end_date=None):
-    from datetime import datetime  # not used directly; kept for parity
+    """
+    Compute PRAC per player (by jersey):
+      - For each practice in range, every jersey NOT listed in absent_numbers gets +1.
+    Returns dict { "12": 5, "23": 4, ... }.
+    """
+    # local import to avoid changing your global imports footprint elsewhere
+    from datetime import datetime  # safe: only used in helpers above
     start_d = _norm_date_yyyy_mm_dd(start_date) if start_date else None
     end_d   = _norm_date_yyyy_mm_dd(end_date) if end_date else None
 
@@ -581,6 +386,8 @@ def compute_practices_played_counts(roster_map, practices_meta, start_date=None,
                 counts[j] += 1
     return counts
 
+# ------------------------------------------------------------------------------
+
 # ------------------------- Shooter / Defender / Assister parsing -------------------------
 _CAP = r"[A-Z][a-zA-Z0-9.\-']+"
 _FULLNAME = rf"{_CAP}(?:\s+{_CAP})?"
@@ -593,7 +400,7 @@ _MISS_RE  = re.compile(r"\bmiss(?:es|ed)?\b", re.IGNORECASE)
 _ASSIST_BY_RE   = re.compile(rf"(?<!screen )\bassist(?:ed)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
 _ASSIST_WITH_RE = re.compile(rf"({_FULLNAME})\s+(?:with|get[s]?s?\s+the)\s+assist\b", re.IGNORECASE)
 
-# multiple names after "screen assist by"
+# UPDATED: support multiple names after "screen assist by" (commas / 'and') and allow closing punctuation
 _SCREEN_ASSIST_LIST_RE = re.compile(
     rf"\bscreen\s+assist\s+by\s+((?:{_FULLNAME}(?:\s*(?:,|and)\s*)?)+)[\s\).,!;:]*",
     re.IGNORECASE
@@ -603,10 +410,13 @@ _FROM_GUARDED_RE = re.compile(rf"\bfrom\s+({_FULLNAME})\s+guarded\s+by\s+({_FULL
 _TO_GUARDED_RE   = re.compile(r"\bto\s+({_FULLNAME})\s+guarded\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
 _FOR_GUARDED_RE  = re.compile(r"\bfor\s+({_FULLNAME})\s+guarded\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
 
+# ---- scrub trailing verbs accidentally glued to a name
 _VERB_TAILS = {
     "makes","made","misses","missed","brings","bring","passes","pass","drives","drive",
     "posts","posting","screens","screen","cuts","cut","hands","handoff","handoffs","with","gets","get","keeps","keep",
+    # extras seen in off-ball text
     "comes","rolls","pops","slips","ghosts","rejects",
+    # NEW: rescreen variants so "Lusk rescreens" -> "Lusk"
     "rescreen","rescreens","rescreened","rescreening","re-screen","re-screens","re-screened","re-screening"
 }
 def _trim_trailing_verb(name: str) -> str:
@@ -616,6 +426,7 @@ def _trim_trailing_verb(name: str) -> str:
         parts = parts[:-1]
     return " ".join(parts)
 
+# NEW: strip leading prepositions/glue before names ("and Boyd" -> "Boyd")
 def _strip_leading_preps(s: str) -> str:
     return re.sub(r"^(?:from|by|to|off|of|the|and)\s+", "", (s or "").strip(), flags=re.IGNORECASE)
 
@@ -636,6 +447,7 @@ def _nth_shot_line(pbp_text: str, n_index: int) -> str:
         return shot_lines[0]
     return pbp_text or ""
 
+# === NEW: normalize any name outputs against roster ===
 def _norm(nm: str) -> str:
     return _normalize_to_roster(_strip_leading_preps(_trim_trailing_verb((nm or "").strip())))
 
@@ -673,10 +485,19 @@ def _parse_assister(text: str, prefer_line: str = "") -> str:
         if m: return _norm(m.group(1))
     return ""
 
-# Blocker names (optional)
+# ===================== NEW: Blocker extraction from PBP text =====================
+# These helpers DO NOT change existing parsing behavior; they enable downstream
+# code to render "Block: <Name>" when shorthand lacks a jersey (e.g., "blks").
 _BLOCKS_SUBJ_RE = re.compile(rf"({_FULLNAME})\s+block(?:s|ed|ing)?\s+(?:the\s+)?shot\b", re.IGNORECASE)
 _BLOCKS_BY_RE   = re.compile(rf"\b(?:shot\s+)?block(?:s|ed|ing)?\s+by\s+({_FULLNAME})\b", re.IGNORECASE)
+
 def parse_blockers_from_pbp(pbp_text: str, prefer_line: str = "") -> list[str]:
+    """
+    Find shot blocker name(s) from play-by-play natural language, e.g.:
+      - 'Lusk blocks the shot'
+      - 'Shot blocked by Lusk'
+    Returns a de-duped, roster-normalized list of full names.
+    """
     names = []
     seen = set()
     for src in (prefer_line, pbp_text or ""):
@@ -684,29 +505,34 @@ def parse_blockers_from_pbp(pbp_text: str, prefer_line: str = "") -> list[str]:
         if not t:
             continue
         for m in re.finditer(_BLOCKS_SUBJ_RE, t):
-            nm = _norm(m.group(1)); k = nm.lower()
+            nm = _norm(m.group(1))
+            k = nm.lower()
             if nm and k not in seen:
                 names.append(nm); seen.add(k)
         for m in re.finditer(_BLOCKS_BY_RE, t):
-            nm = _norm(m.group(1)); k = nm.lower()
+            nm = _norm(m.group(1))
+            k = nm.lower()
             if nm and k not in seen:
                 names.append(nm); seen.add(k)
     return names
+# =================== END: Blocker extraction from PBP text =======================
+
+# ---- helpers for multi-name parsing ----
 
 def _split_fullname_list(blob: str) -> list[str]:
+    """Split a blob like 'Fontana and Tillotson' or 'Adrianna Fontana, Brooke Tillotson'."""
     names = []
+    # allow trailing punctuation/paren
     blob = re.sub(r"[)\].,!;:\s]+$", "", blob or "")
     for nm in re.findall(_FULLNAME, blob or "", flags=re.IGNORECASE):
         nm = _strip_leading_preps(_trim_trailing_verb(nm.strip()))
         if nm:
             names.append(nm)
+    # NEW: normalize and de-dupe against roster
     return _normalize_list(names)
 
-_SCREEN_ASSIST_LIST_RE = re.compile(
-    rf"\bscreen\s+assist\s+by\s+((?:{_FULLNAME}(?:\s*(?:,|and)\s*)?)+)[\s\).,!;:]*",
-    re.IGNORECASE
-)
 def _parse_screen_assister(text: str, prefer_line: str = "") -> list[str]:
+    """Collect screen assists from the shot line or possession text, de-duped."""
     names = []
     seen = set()
     for src in (prefer_line, text):
@@ -722,6 +548,7 @@ def _parse_screen_assister(text: str, prefer_line: str = "") -> list[str]:
                     seen.add(low)
     return names
 
+# Fallback shooter: last full name before make/miss
 def _guess_shooter_from_make_miss(line: str) -> str:
     if not line: return ""
     m = _MAKE_RE.search(line) or _MISS_RE.search(line)
@@ -730,17 +557,25 @@ def _guess_shooter_from_make_miss(line: str) -> str:
     names = re.findall(_FULLNAME, prefix)
     return _norm(names[-1]) if names else ""
 
-# Multi-defender parsing
+# ================== NEW: multi-defender & "rotating over" parsing ==================
+# Detect a guarded-by list like: "guarded by Campbell and McAnally"
+# and optional per-name tag "rotating over" e.g. "Lusk rotating over"
 _GUARDED_BY_BLOCK_RE = re.compile(r"\bguarded\s+by\s+(.+?)\s*(?:$|[.!)]|\bmake|\bmiss|\bpasses|\bdriv|\bpost|\bwith|\bassisted)", re.IGNORECASE)
 _GUARDED_DEF_ITEM_RE = re.compile(rf"({_FULLNAME})(?:\s+rotating\s+over)?", re.IGNORECASE)
 _HELP_LINE_RE = re.compile(r"\bhelp(?:s|ed|ing)?\b|\bsteps\s+in\s+to\s+help\b", re.IGNORECASE)
 
 def _parse_defenders_with_tags_from_line(line: str):
+    """
+    Return list of dicts: [{"name": Full Name, "rotating_over": bool}, ...]
+    from a shot line like "Fontana guarded by Lusk rotating over" or
+    "Lusk guarded by Campbell and McAnally misses the shot".
+    """
     t = _clean_frag(line or "")
     out = []
     seen = set()
     m = _GUARDED_BY_BLOCK_RE.search(t)
     if not m:
+        # fallback to single pair, for back-compat
         a, b = _first_guard_pair(line)
         if b:
             low = b.lower()
@@ -750,6 +585,7 @@ def _parse_defenders_with_tags_from_line(line: str):
         return out
 
     blob = m.group(1) or ""
+    # Split on commas/ands but rely on name matcher to extract cleanly
     for mm in re.finditer(_GUARDED_DEF_ITEM_RE, blob):
         nm = _norm(mm.group(1))
         rot = bool(re.search(r"\s+rotating\s+over\s*$", mm.group(0), re.IGNORECASE))
@@ -761,6 +597,10 @@ def _parse_defenders_with_tags_from_line(line: str):
     return out
 
 def _format_defenders_for_display(def_list):
+    """
+    Join defenders into a single display string, appending ' rotating over'
+    to any name tagged as rotating_over=True.
+    """
     if not def_list:
         return ""
     parts = []
@@ -768,23 +608,25 @@ def _format_defenders_for_display(def_list):
         nm = d.get("name","")
         if not nm: 
             continue
-        parts.append(f"{nm} rotating over" if d.get("rotating_over") else nm)
+        if d.get("rotating_over"):
+            parts.append(f"{nm} rotating over")
+        else:
+            parts.append(nm)
     return ", ".join(parts)
 
 def _possession_has_help_text(pbp_text: str) -> bool:
+    """Lightweight flag so downstream UI can highlight 'shot out of help' if needed."""
     t = _clean_frag(pbp_text or "")
     return bool(_HELP_LINE_RE.search(t))
 
 def extract_roles_for_shot(pbp_text: str, shot_index: int):
-    """
-    Return tuple:
-      (shooter, onball_def, assister, screen_assists[list], candidate_action_lines[list])
-    """
+    """Return (shooter, onball_def, assister, screen_assists[list], candidate_action_lines[])"""
     line = _nth_shot_line(pbp_text or "", shot_index)
     shooter, onball_def = _first_guard_pair(line)
     if not shooter:
         shooter = _guess_shooter_from_make_miss(line)
 
+    # --- NEW: upgrade on-ball defender to support multi-defenders and 'rotating over'
     defenders = _parse_defenders_with_tags_from_line(line)
     if defenders:
         onball_def = _format_defenders_for_display(defenders)
@@ -792,25 +634,33 @@ def extract_roles_for_shot(pbp_text: str, shot_index: int):
     assister = _parse_assister(pbp_text or "", prefer_line=line)
     screen_ast_list = _parse_screen_assister(pbp_text or "", prefer_line=line)
 
+    # include lines that plausibly contain actions OR coverage cues
     candidates = []
     for ln in (pbp_text or "").splitlines():
         lcl = ln.lower()
         if any(k in lcl for k in [
+            # on-ball phrases
             "pick and roll","pick and pop","dribble hand","hands off","hand off","handoff",
             "slip","ghost","reject","bring","drive",
-            "post up","posting up","posts up",
+            "post up","posting up","posts up",   # <-- added posts up
             "keep the handoff","handoff keep",
             "rescreen","re-screen",
+            # off-ball phrases:
             "backdoor","backdoor cut","pin down","pindown","flare screen","back screen","away screen", "hammer screen", "ucla screen",
             "cross screen","wedge screen","rip screen","stagger screen","stagger screens","iverson screen",
             "elevator screen","elevator screens",
+            # coverage-only cues (include common inflections!)
             "switch", "switches", "switched", "switching",
             "chase over", "chases over",
             "cut under", "cuts under",
             "caught on screen", "top lock", "ice", "blitz",
+            # help-defense cues (still candidates, but no separate “Out of help” block)
             "help", "steps in to help"
         ]):
             candidates.append(ln.strip())
+
+    # (Optional downstream use) You can also check _possession_has_help_text(pbp_text)
+    # to tag "shots out of help" in your UI if you’d like.
 
     return shooter, onball_def, assister, screen_ast_list, candidates
 
@@ -825,14 +675,16 @@ _DHO_RE = re.compile(
 )
 _HO_RE  = re.compile(r"\bhand(?:s)?\s*off\s+to\b|\bhand-?off\s+to\b|\bhandoff\s+to\b", re.IGNORECASE)
 _KP_RE  = re.compile(r"\bkeep[s]?\s+the\s+hand[\s-]?off\b|\bhandoff\s+keep\b", re.IGNORECASE)
+
+# NEW: rescreen detector
 _RESCR_RE = re.compile(r"\brescreen(?:s|ed|ing)?\b|\bre\-screen(?:s|ed|ing)?\b", re.IGNORECASE)
 
-_COV_CH = re.compile(r"\bchas(?:e|es|ed|ing)\s+over\b", re.IGNORECASE)
-_COV_CT = re.compile(r"\bcut(?:s|ting)?\s+(?:under|below|around)\b", re.IGNORECASE)
-_COV_SW = re.compile(r"\bswitch(?:es|ed|ing)?\b(?:\s+(?:onto|on)\s+({_FULLNAME}))?", re.IGNORECASE)
-_COV_BZ = re.compile(r"\bblitz(?:es|ed|ing)?\b", re.IGNORECASE)
-_COV_CS = re.compile(r"\bcaught\s+on\s+screen\b", re.IGNORECASE)
-_COV_TL = re.compile(r"\btop\s+lock(?:s|ed|ing)?\b", re.IGNORECASE)
+_COV_CH = re.compile(r"\bchas(?:e|es|ed|ing)\s+over\b", re.IGNORECASE)        # ch
+_COV_CT = re.compile(r"\bcut(?:s|ting)?\s+(?:under|below|around)\b", re.IGNORECASE)  # ct
+_COV_SW = re.compile(r"\bswitch(?:es|ed|ing)?\b(?:\s+(?:onto|on)\s+({_FULLNAME}))?", re.IGNORECASE)  # sw
+_COV_BZ = re.compile(r"\bblitz(?:es|ed|ing)?\b", re.IGNORECASE)               # bz
+_COV_CS = re.compile(r"\bcaught\s+on\s+screen\b", re.IGNORECASE)              # cs
+_COV_TL = re.compile(r"\btop\s+lock(?:s|ed|ing)?\b", re.IGNORECASE)           # tl
 _COV_ICE = re.compile(r"\bice(?:s|d|ing)?\b", re.IGNORECASE)
 
 def _parse_coverages(line: str):
@@ -851,6 +703,7 @@ def _parse_coverages(line: str):
         out.append({"cov":"sw", "label":"Switch", "onto": _normalize_to_roster(who)})
     return out
 
+# ---- helper: all guarded-by pairs in a line, in order (BH/def first, then any screeners/defs)
 def _all_guard_pairs_in_line(line: str):
     out = []
     for m in re.finditer(_SHOOT_GUARD_RE, _clean_frag(line)):
@@ -877,13 +730,14 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
         lc = ln.lower()
         added_action = False
         covs_line = _parse_coverages(ln)
-        is_shot_ln = _is_shot_line(ln)
+        is_shot_ln = _is_shot_line(ln)  # <-- NEW: tag whether this specific line is the shot line
 
         first_a, first_b = _first_guard_pair(ln)
         from_a, from_b = _from_pair(ln)
         to_a,   to_b   = _to_pair(ln)
         for_a,  for_b  = _for_pair(ln)
 
+        # gather ALL guarded-by pairs on the line (BH first, then screeners)
         guard_pairs = _all_guard_pairs_in_line(ln)
 
         if _KP_RE.search(lc):
@@ -891,7 +745,7 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "keeper": first_a, "keeper_def": first_b,
                  "intended": (for_a or to_a), "intended_def": (for_b or to_b),
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
             actions.append(d); _remember(d); added_action = True
 
         elif _DHO_RE.search(lc):
@@ -899,7 +753,7 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "giver": first_a, "giver_def": first_b,
                  "receiver": to_a, "receiver_def": to_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
             actions.append(d); _remember(d); added_action = True
 
         elif _HO_RE.search(lc):
@@ -907,7 +761,7 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "giver": first_a, "giver_def": first_b,
                  "receiver": to_a, "receiver_def": to_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
             actions.append(d); _remember(d); added_action = True
 
         elif "pick and roll" in lc:
@@ -917,11 +771,13 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                 "screener": from_a, "screener_def": from_b,
                 "screen_assist": (screen_ast_in_possession or ""),
                 "coverages": covs_line,
-                "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)
+                "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)  # NEW
             }
+            # NEW: support multiple screeners by using all guarded pairs after BH/def
             if guard_pairs and len(guard_pairs) > 1:
                 scr_pairs = guard_pairs[1:]
                 d["screeners"] = [{"name": a, "def": b} for (a,b) in scr_pairs]
+                # keep single fields for back-compat (first screener)
                 d["screener"], d["screener_def"] = scr_pairs[0]
             actions.append(d); _remember(d); added_action = True
 
@@ -932,7 +788,7 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                 "screener": from_a, "screener_def": from_b,
                 "screen_assist": (screen_ast_in_possession or ""),
                 "coverages": covs_line,
-                "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)
+                "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)  # NEW
             }
             if guard_pairs and len(guard_pairs) > 1:
                 scr_pairs = guard_pairs[1:]
@@ -947,10 +803,10 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "bh": bh, "bh_def": bh_def,
                  "screener": scr, "screener_def": scr_def,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
             actions.append(d); _remember(d); added_action = True
 
-        elif re.search(r"\bslip(?:s|ped|ping)?\b", lc) or re.search(r"\bghost(?:s|ed|ing)?", lc) or re.search(r"\breject(?:s|ed|ing)?\b", lc):
+        elif _SLIP_RE.search(lc) or _GHOST_RE.search(lc) or _REJECT_RE.search(lc):
             label = "Slip" if _SLIP_RE.search(lc) else ("Ghost" if _GHOST_RE.search(lc) else "Reject")
             bh, bh_def = "", ""
             scr, scr_def = "", ""
@@ -973,25 +829,25 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
                  "label":label, "bh":bh, "bh_def":bh_def,
                  "screener":scr, "screener_def":scr_def,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
             actions.append(d); _remember(d); added_action = True
 
         elif re.search(r"bring[s]?\s+.*over\s+half\s*court", lc):
             d = {"type":"h","label":"Bring over halfcourt","bh":first_a,"bh_def":first_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
             actions.append(d); _remember(d); added_action = True
 
         elif re.search(r"\bdriv(?:e|es|ing)\b", lc):
             d = {"type":"d","label":"Drive","bh":first_a,"bh_def":first_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
             actions.append(d); _remember(d); added_action = True
 
         elif re.search(r"\bpost(?:s)?\s+up\b|\bposting\s+up\b", lc):
             d = {"type":"p","label":"Post up","bh":first_a,"bh_def":first_b,
                  "coverages": covs_line,
-                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}
+                 "connected_to_shot": bool(is_shot_ln), "shot_connected": bool(is_shot_ln)}  # NEW
             actions.append(d); _remember(d); added_action = True
 
         # if this line had only coverage, attach to the most recent action
@@ -1006,10 +862,15 @@ def parse_onball_actions_from_pbp(lines, screen_ast_in_possession):
 
     return actions
 
-# ========================= Ratings & +/- helpers =========================
+
+# ========================= NEW (mk12-rtg): Ratings & +/- declarations + helpers =========================
+# These are *additive* declarations usable by later sections when aggregating player rows.
+
+# Per-player rating/score keys we will populate later:
 RATING_STATS_KEYS = ["PF", "PA", "ORtg", "DRtg", "NET", "+/-"]
 
 def _div0(n, d, default=0.0):
+    """Safe divide with graceful zero/invalid handling."""
     try:
         d = float(d)
         return float(n) / d if d != 0 else default
@@ -1017,24 +878,36 @@ def _div0(n, d, default=0.0):
         return default
 
 def calc_off_rating(pf, op):
+    """ORtg = 100 * (Points For / Offensive Possessions)"""
     return 100.0 * _div0(pf, op, 0.0)
 
 def calc_def_rating(pa, dp):
+    """DRtg = 100 * (Points Against / Defensive Possessions)"""
     return 100.0 * _div0(pa, dp, 0.0)
 
 def calc_net_rating(ortg, drtg):
+    """NET = ORtg - DRtg"""
     try:
         return float(ortg) - float(drtg)
     except Exception:
         return 0.0
 
 def calc_plus_minus(pf, pa):
+    """+/- = PF - PA"""
     try:
         return float(pf) - float(pa)
     except Exception:
         return 0.0
 
 def compute_ratings_for_row(row: dict) -> dict:
+    """
+    Fill ORtg, DRtg, NET, +/- on a per-player row *in place* using:
+      - PF (points for)
+      - PA (points against)
+      - OP (offensive possessions)
+      - DP (defensive possessions)
+    Any missing inputs are treated as 0.
+    """
     if not isinstance(row, dict):
         return row
     pf = row.get("PF", 0)
@@ -1046,8 +919,7 @@ def compute_ratings_for_row(row: dict) -> dict:
     row["NET"]  = calc_net_rating(row["ORtg"], row["DRtg"])
     row["+/-"]  = calc_plus_minus(pf, pa)
     return row
-# ========================= END SECTION 1 ======================================
-
+# ========================= END (mk12-rtg) =========================
 
 
 
@@ -3566,33 +3438,6 @@ def zone_legend_component():
 
 
 #-----------------------------------------Section 5--------------------------------------------------------------
-#
-# Robust, lazy layout builder that never returns None (prevents blank screen on Render)
-#
-
-# Small helpers so missing globals never crash the layout at import time
-def _g(name, default=None):
-    try:
-        return globals().get(name, default)
-    except Exception:
-        return default
-
-def _safe_fig(default_title=""):
-    try:
-        import plotly.graph_objects as go
-        fig = go.Figure()
-        if default_title:
-            fig.update_layout(title=default_title, margin=dict(l=10, r=10, t=30, b=10))
-        return fig
-    except Exception:
-        # Absolute fallback (shouldn't happen on Render)
-        return None
-
-def _safe_component(component, fallback):
-    try:
-        return component if component is not None else fallback
-    except Exception:
-        return fallback
 
 # ---------------- roster harvesting & normalization ----------------
 def _harvest_fullnames_from_any(value):
@@ -3987,7 +3832,6 @@ def _strip_trailing_modifiers(nm: str) -> str:
     return s
 
 # ====================== mk5 UI (tabs, filters, tables) ======================
-
 def _mk_multi(label, cid, placeholder="", options=None):
     return dcc.Dropdown(
         id=cid, options=(options or []), multi=True, placeholder=placeholder,
@@ -4035,7 +3879,13 @@ DEFENSE_OPTIONS = [
     {"label":"Zone","value":"Zone"},
 ]
 
+# ---------- Column ordering helpers (force your desired order even if builder returns extras)
 def _order_columns_with_alias_groups(cols, desired_id_groups):
+    """
+    desired_id_groups: list of either strings (single id) or list of ids (aliases).
+    Returns cols ordered by desired_id_groups; appends any extras afterward.
+    If a group lists aliases, the first found alias is used and others are skipped.
+    """
     cols_by_id = {c["id"]: c for c in cols}
     used = set()
     ordered = []
@@ -4049,12 +3899,15 @@ def _order_columns_with_alias_groups(cols, desired_id_groups):
         if chosen:
             ordered.append(chosen)
             used.add(chosen["id"])
+    # append any remaining cols in original appearance
     for c in cols:
         if c["id"] not in used:
             ordered.append(c); used.add(c["id"])
     return ordered
 
 # ---------- Build column configs (DO THIS ABOVE app.layout)
+
+# BASIC: ensure PRAC sits between Player and PTS
 _BS_DESIRED = [
     "Player","PRAC","PTS","FGM","FGA","FG%","2PM","2PA","2P%","3PM","3PA","3P%",
     "AST","SA","DRB","ORB","TRB","LBTO","DBTO","TO","STL","DEF","BLK"
@@ -4065,6 +3918,8 @@ _raw_basic_cols = (
 )
 basic_cols = _order_columns_with_alias_groups(_raw_basic_cols, _BS_DESIRED)
 
+# ADVANCED: enforce order; accept +/- id aliases if needed
+# Aliases for plus/minus handled: "+/-", "+/_", "plus_minus"
 _AS_DESIRED = [
     "Player","OP","DP","ORtg","DRtg","NET","eFG%","PPS","AST%","TOV%","AST/TO", ["+/-", "+/_", "plus_minus"]
 ]
@@ -4074,269 +3929,263 @@ _raw_adv_cols = (
 )
 adv_cols = _order_columns_with_alias_groups(_raw_adv_cols, _AS_DESIRED)
 
-# ---- LAZY LAYOUT: Dash will call this on each page load; must never raise or return None
-def serve_layout():
-    # Pull (or default) figures/components so missing globals do not break layout
-    shot_fig = _g("_initial_shot_fig", _safe_fig("Shot Chart"))
-    zone_fig = _g("_initial_zone_fig", _safe_fig("Hot/Cold Zones"))
-    zone_legend = _safe_component(_g("zone_legend_component"), lambda: html.Div())()
-    bs_table_id = (BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table")
+# --- Tooltip CSS (global to both tables): force tooltips ABOVE header text ---
+TOOLTIP_CSS_ABOVE = [
+    {
+        "selector": ".dash-table-tooltip",
+        "rule": """
+            top: auto !important;
+            bottom: calc(100% + 6px) !important;
+            left: 50% !important;
+            transform: translateX(-50%) !important;
+            white-space: normal;
+            padding: 4px 6px;
+            background: #f8f9fa;
+            color: #111;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            z-index: 1000;
+        """
+    },
+    {
+        "selector": ".dash-table-tooltip:before",
+        "rule": """
+            content: "";
+            position: absolute;
+            bottom: -6px;
+            left: 50%;
+            transform: translateX(-50%);
+            border-width: 6px 6px 0 6px;
+            border-style: solid;
+            border-color: #ccc transparent transparent transparent;
+        """
+    },
+    {
+        "selector": ".dash-table-tooltip:after",
+        "rule": """
+            content: "";
+            position: absolute;
+            bottom: -5px;
+            left: 50%;
+            transform: translateX(-50%);
+            border-width: 5px 5px 0 5px;
+            border-style: solid;
+            border-color: #f8f9fa transparent transparent transparent;
+        """
+    },
+    {"selector": ".dash-spreadsheet-container .dash-header", "rule": "overflow: visible;"},
+    {"selector": ".dash-spreadsheet .cell", "rule": "overflow: visible; position: relative;"}
+]
 
-    return html.Div(
-        style={"maxWidth":"1600px","margin":"0 auto","padding":"10px"},
-        children=[
-            html.H1(
-                "CWB Practice Stats",
-                style={"textAlign":"center","margin":"6px 0 12px 0","fontFamily":"system-ui","fontWeight":800,"letterSpacing":"0.3px"}
-            ),
+# ---- mk5 ADD: layout (no Loading spinners, no timer-based Interval)
+app.layout = html.Div(
+    style={"maxWidth":"1600px","margin":"0 auto","padding":"10px"},
+    children=[
+        html.Div([
+            html.Div(f"Data source: {DATA_PATH}", style={"color":"#666","fontSize":"12px","marginBottom":"2px"}),
+            html.Div("Charts update when data or filters change", style={"color":"#888","fontSize":"10px"}),
+            html.Div(id="status", style={"color":"#888","fontSize":"10px"}),
+        ], style={"textAlign":"center","marginBottom":"8px"}),
 
-            html.Div([
-                html.Div(f"Data source: {_g('DATA_PATH','(not set)')}", style={"color":"#666","fontSize":"12px","marginBottom":"2px"}),
-                html.Div("Charts update when data or filters change", style={"color":"#888","fontSize":"10px"}),
-                html.Div(id="status", style={"color":"#888","fontSize":"10px"}),
-            ], style={"textAlign":"center","marginBottom":"8px"}),
+        dcc.Tabs(id="tabs", value="tab_shooting", children=[
+            dcc.Tab(label="Shooting", value="tab_shooting", children=[
+                # ---------- Shooting filters
+                html.Div([
+                    _pill("Practice Date(s)", dcc.DatePickerRange(
+                        id="flt_date_range_shoot",
+                        min_date_allowed=None, max_date_allowed=None,
+                        start_date=None, end_date=None,
+                        minimum_nights=0,
+                        display_format="YYYY-MM-DD",
+                        style={"background":"white"}
+                    )),
+                    _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_shoot","e.g. 3v3 / 5v5")),
+                    _pill("Drill", _mk_multi("Drill","flt_drill_full_shoot","e.g. 5v5 Stags")),
+                    _pill("Shooter", _mk_multi("Shooter","flt_shooter","Filter by shooter")),
+                    _pill("Defender(s)", _mk_multi("Defender(s)","flt_defenders","Who contested the shot")),
+                    _pill("Assister", _mk_multi("Assister","flt_assister","Passer on made FG")),
+                    _pill("Screen Assister", _mk_multi("Screen Assister","flt_screen_assister","Who set the screen")),
+                    _pill("On-Ball Action", dcc.Dropdown(
+                        id="flt_onball", options=ONBALL_OPTIONS, multi=True, placeholder="Select on-ball actions",
+                        style={"minWidth":"200px"}
+                    )),
+                    _pill("Off-Ball Action", dcc.Dropdown(
+                        id="flt_offball", options=OFFBALL_OPTIONS, multi=True, placeholder="Select off-ball actions",
+                        style={"minWidth":"200px"}
+                    )),
+                    _pill("Defense", dcc.Dropdown(
+                        id="flt_defense_shoot", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
+                        style={"minWidth":"140px"}
+                    )),
+                    html.Button("Clear", id="btn_clear_shoot", n_clicks=0,
+                                style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
+                ], style={
+                    "display":"flex","flexWrap":"wrap","gap":"12px",
+                    "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
+                    "borderRadius":"8px","padding":"10px","marginBottom":"10px"
+                }),
 
-            dcc.Tabs(id="tabs", value="tab_shooting", children=[
-                dcc.Tab(label="Shooting", value="tab_shooting", children=[
+                # Single row: Stats | Shot Chart | Hot/Cold
+                html.Div([
+                    # --- 1) Shooting Stats (left) ---
                     html.Div([
-                        _pill("Practice Date(s)", dcc.DatePickerRange(
-                            id="flt_date_range_shoot",
-                            min_date_allowed=None, max_date_allowed=None,
-                            start_date=None, end_date=None,
-                            minimum_nights=0,
-                            display_format="YYYY-MM-DD",
-                            style={"background":"white"}
-                        )),
-                        _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_shoot","e.g. 3v3 / 5v5")),
-                        _pill("Drill", _mk_multi("Drill","flt_drill_full_shoot","e.g. 5v5 Stags")),
-                        _pill("Shooter", _mk_multi("Shooter","flt_shooter","Filter by shooter")),
-                        _pill("Defender(s)", _mk_multi("Defender(s)","flt_defenders","Who contested the shot")),
-                        _pill("Assister", _mk_multi("Assister","flt_assister","Passer on made FG")),
-                        _pill("Screen Assister", _mk_multi("Screen Assister","flt_screen_assister","Who set the screen")),
-                        _pill("On-Ball Action", dcc.Dropdown(
-                            id="flt_onball", options=ONBALL_OPTIONS, multi=True, placeholder="Select on-ball actions",
-                            style={"minWidth":"200px"}
-                        )),
-                        _pill("Off-Ball Action", dcc.Dropdown(
-                            id="flt_offball", options=OFFBALL_OPTIONS, multi=True, placeholder="Select off-ball actions",
-                            style={"minWidth":"200px"}
-                        )),
-                        _pill("Defense", dcc.Dropdown(
-                            id="flt_defense_shoot", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
-                            style={"minWidth":"140px"}
-                        )),
-                        html.Button("Clear", id="btn_clear_shoot", n_clicks=0,
-                                    style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
-                    ], style={
-                        "display":"flex","flexWrap":"wrap","gap":"12px",
-                        "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
-                        "borderRadius":"8px","padding":"10px","marginBottom":"10px"
-                    }),
-
-                    html.Div([
-                        html.Div([
-                            html.Div("Shooting Stats", style={
-                                "textAlign": "center", "fontSize": "20px", "fontWeight": 700, "marginBottom": "6px"
-                            }),
-                            html.Div(id="shooting_stats_box", style={
-                                "display": "grid", "gridTemplateColumns": "repeat(3, 1fr)", "gap": "10px"
-                            }),
-                        ], style={"width": "300px", "padding": "8px", "border": "1px solid #eee",
-                                  "borderRadius": "8px", "background": "white"}),
-
-                        html.Div([
-                            html.Div("Shot Chart", style={
-                                "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
-                            }),
-                            dcc.Graph(
-                                id="shot_chart",
-                                config={"displayModeBar": False},
-                                figure=shot_fig,
-                                animate=False,
-                                clear_on_unhover=False,
-                            ),
-                            html.Div([
-                                html.Span("● Make", style={"color": "green", "marginRight": "20px", "fontWeight": 600}),
-                                html.Span("✖ Miss", style={"color": "red", "fontWeight": 600}),
-                            ], style={"textAlign": "center", "marginTop": "-4px"}),
-                        ], style={"width": "600px"}),
-
-                        html.Div([
-                            html.Div("Hot/Cold Zones", style={
-                                "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
-                            }),
-                            dcc.Graph(
-                                id="zone_chart",
-                                config={"displayModeBar": False},
-                                figure=zone_fig,
-                                animate=False,
-                                clear_on_unhover=False,
-                            ),
-                            zone_legend,
-                        ], style={"width": "600px"}),
-                    ], id="shooting-row", style={
-                        "display": "grid",
-                        "gridTemplateColumns": "300px 600px 600px",
-                        "columnGap": "20px",
-                        "alignItems": "center",
-                        "justifyContent": "center",
-                        "margin": "0 auto",
-                        "maxWidth": "1600px",
-                        "overflowX": "visible",
-                    }),
-
-                    html.Div(id="shot_details", style={"maxWidth":"920px","margin":"14px auto 0 auto"}),
-                ]),
-
-                dcc.Tab(label="Stats", value="tab_stats", children=[
-                    html.Div([
-                        _pill("Practice Date(s)", dcc.DatePickerRange(
-                            id="flt_date_range_stats",
-                            min_date_allowed=None, max_date_allowed=None,
-                            start_date=None, end_date=None,
-                            minimum_nights=0,
-                            display_format="YYYY-MM-DD",
-                            style={"background":"white"}
-                        )),
-                        _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_stats","e.g. 3v3 / 5v5")),
-                        _pill("Drill", _mk_multi("Drill","flt_drill_full_stats","e.g. 5v5 Stags")),
-                        _pill("Defense", dcc.Dropdown(
-                            id="flt_defense_stats", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
-                            style={"minWidth":"140px"}
-                        )),
-                        html.Button("Clear", id="btn_clear_stats", n_clicks=0,
-                                    style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
-                    ], style={
-                        "display":"flex","flexWrap":"wrap","gap":"12px",
-                        "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
-                        "borderRadius":"8px","padding":"10px","marginBottom":"10px"
-                    }),
-
-                    html.Div([
-                        html.Div("Basic Stats (click headers to sort)", style={
-                            "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
+                        html.Div("Shooting Stats", style={
+                            "textAlign": "center", "fontSize": "20px", "fontWeight": 700, "marginBottom": "6px"
                         }),
-                        dash_table.DataTable(
-                            id=bs_table_id,
-                            columns=basic_cols,
-                            data=[],
-                            sort_action="native",
-                            style_table={"overflowX":"auto"},
-                            style_cell={
-                                "fontFamily":"Arial","fontSize":"13px","padding":"6px",
-                                "textAlign":"center","overflow":"visible"
-                            },
-                            style_header={
-                                "fontWeight":"700","backgroundColor":"#f5f5f5",
-                                "cursor":"pointer",
-                                "overflow":"visible",
-                                "textDecoration":"none"
-                            },
-                            tooltip_header=build_header_tooltips(basic_cols) if 'build_header_tooltips' in globals() else {},
-                            tooltip_delay=0,
-                            tooltip_duration=None,
-                            fixed_rows={"headers": True},
-                            page_size=50,
-                            css=_g("TOOLTIP_CSS_ABOVE", []),
-                        ),
-                    ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px",
-                              "background":"white","marginBottom":"10px"}),
-
-                    html.Div([
-                        html.Div("Advanced Stats (click headers to sort)", style={
-                            "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
+                        html.Div(id="shooting_stats_box", style={
+                            "display": "grid", "gridTemplateColumns": "repeat(3, 1fr)", "gap": "10px"
                         }),
-                        dash_table.DataTable(
-                            id="advanced_stats_table",
-                            columns=adv_cols,
-                            data=[],
-                            sort_action="native",
-                            style_table={"overflowX":"auto"},
-                            style_cell={
-                                "fontFamily":"Arial","fontSize":"13px","padding":"6px",
-                                "textAlign":"center","overflow":"visible"
-                            },
-                            style_header={
-                                "fontWeight":"700","backgroundColor":"#f5f5f5",
-                                "cursor":"pointer",
-                                "overflow":"visible",
-                                "textDecoration":"none"
-                            },
-                            tooltip_header=build_header_tooltips(adv_cols) if 'build_header_tooltips' in globals() else {},
-                            tooltip_delay=0,
-                            tooltip_duration=None,
-                            fixed_rows={"headers": True},
-                            page_size=50,
-                            css=_g("TOOLTIP_CSS_ABOVE", []),
+                    ], style={"width": "300px", "padding": "8px", "border": "1px solid #eee",
+                              "borderRadius": "8px", "background": "white"}),
+
+                    # --- 2) Shot Chart (middle) ---
+                    html.Div([
+                        html.Div("Shot Chart", style={
+                            "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
+                        }),
+                        dcc.Graph(
+                            id="shot_chart",
+                            config={"displayModeBar": False},
+                            figure=_initial_shot_fig,
+                            animate=False,
+                            clear_on_unhover=False,
                         ),
-                    ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px","background":"white"}),
-                ]),
+                        html.Div([
+                            html.Span("● Make", style={"color": "green", "marginRight": "20px", "fontWeight": 600}),
+                            html.Span("✖ Miss", style={"color": "red", "fontWeight": 600}),
+                        ], style={"textAlign": "center", "marginTop": "-4px"}),
+                    ], style={"width": "600px"}),
+
+                    # --- 3) Hot/Cold Zones (right) ---
+                    html.Div([
+                        html.Div("Hot/Cold Zones", style={
+                            "textAlign": "center", "fontSize": "26px", "fontWeight": 800, "marginBottom": "4px"
+                        }),
+                        dcc.Graph(
+                            id="zone_chart",
+                            config={"displayModeBar": False},
+                            figure=_initial_zone_fig,
+                            animate=False,
+                            clear_on_unhover=False,
+                        ),
+                        zone_legend_component(),
+                    ], style={"width": "600px"}),
+                ], id="shooting-row", style={
+                    "display": "grid",
+                    "gridTemplateColumns": "300px 600px 600px",
+                    "columnGap": "20px",
+                    "alignItems": "center",
+                    "justifyContent": "center",
+                    "margin": "0 auto",
+                    "maxWidth": "1600px",
+                    "overflowX": "visible",
+                }),
+
+                html.Div(id="shot_details", style={"maxWidth":"920px","margin":"14px auto 0 auto"}),
             ]),
 
-            # ---- state stores (used by callbacks in Sections 6–8)
-            dcc.Store(id="sel_pos", data=[]),
-            dcc.Store(id="filters_shoot_state"),
-            dcc.Store(id="filters_stats_state"),
-            dcc.Store(id="options_cache", data={}),
+            dcc.Tab(label="Stats", value="tab_stats", children=[
+                # ---------- Stats tab filters (subset)
+                html.Div([
+                    _pill("Practice Date(s)", dcc.DatePickerRange(
+                        id="flt_date_range_stats",
+                        min_date_allowed=None, max_date_allowed=None,
+                        start_date=None, end_date=None,
+                        minimum_nights=0,
+                        display_format="YYYY-MM-DD",
+                        style={"background":"white"}
+                    )),
+                    _pill("Drill Size", _mk_multi("Drill Size","flt_drill_size_stats","e.g. 3v3 / 5v5")),
+                    _pill("Drill", _mk_multi("Drill","flt_drill_full_stats","e.g. 5v5 Stags")),
+                    _pill("Defense", dcc.Dropdown(
+                        id="flt_defense_stats", options=DEFENSE_OPTIONS, multi=True, placeholder="Man / Zone",
+                        style={"minWidth":"140px"}
+                    )),
+                    html.Button("Clear", id="btn_clear_stats", n_clicks=0,
+                                style={"height":"34px","alignSelf":"flex-end","marginLeft":"8px"}),
+                ], style={
+                    "display":"flex","flexWrap":"wrap","gap":"12px",
+                    "alignItems":"end","background":"#fafafa","border":"1px solid #eee",
+                    "borderRadius":"8px","padding":"10px","marginBottom":"10px"
+                }),
 
-            # NEW: precomputed rows for first paint
-            dcc.Store(id="store_rows_full"),
-            dcc.Store(id="store_rows_stats"),
+                # ---------- Stats table (BASIC)
+                html.Div([
+                    html.Div("Basic Stats (click headers to sort)", style={
+                        "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
+                    }),
+                    dash_table.DataTable(
+                        id=(BASIC_STATS_TABLE_ID if 'BASIC_STATS_TABLE_ID' in globals() else "stats_table"),
+                        columns=basic_cols,
+                        data=[],
+                        sort_action="native",
+                        style_table={"overflowX":"auto"},
+                        style_cell={
+                            "fontFamily":"Arial","fontSize":"13px","padding":"6px",
+                            "textAlign":"center","overflow":"visible"
+                        },
+                        style_header={
+                            "fontWeight":"700","backgroundColor":"#f5f5f5",
+                            "cursor":"pointer",
+                            "overflow":"visible",
+                            "textDecoration":"none"
+                        },
+                        tooltip_header=build_header_tooltips(basic_cols),
+                        tooltip_delay=0,
+                        tooltip_duration=None,
+                        fixed_rows={"headers": True},
+                        page_size=50,
+                        css=TOOLTIP_CSS_ABOVE,
+                    ),
+                ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px",
+                          "background":"white","marginBottom":"10px"}),
 
-            # NEW: fire once on first page load to populate stores
-            dcc.Interval(id="boot_once", interval=1, n_intervals=0, max_intervals=1),
+                # ---------- Advanced Stats table (OP/DP + derived metrics)
+                html.Div([
+                    html.Div("Advanced Stats (click headers to sort)", style={
+                        "fontSize":"18px","fontWeight":700,"marginBottom":"6px"
+                    }),
+                    dash_table.DataTable(
+                        id="advanced_stats_table",
+                        columns=adv_cols,
+                        data=[],
+                        sort_action="native",
+                        style_table={"overflowX":"auto"},
+                        style_cell={
+                            "fontFamily":"Arial","fontSize":"13px","padding":"6px",
+                            "textAlign":"center","overflow":"visible"
+                        },
+                        style_header={
+                            "fontWeight":"700","backgroundColor":"#f5f5f5",
+                            "cursor":"pointer",
+                            "overflow":"visible",
+                            "textDecoration":"none"
+                        },
+                        tooltip_header=build_header_tooltips(adv_cols),
+                        tooltip_delay=0,
+                        tooltip_duration=None,
+                        fixed_rows={"headers": True},
+                        page_size=50,
+                        css=TOOLTIP_CSS_ABOVE,
+                    ),
+                ], style={"border":"1px solid #eee","borderRadius":"8px","padding":"8px","background":"white"}),
+            ]),
+        ]),
 
-        ]
-    )
+        # ---- state stores (used by callbacks in Sections 6–8)
+        dcc.Store(id="sel_pos", data=[]),
+        dcc.Store(id="filters_shoot_state"),
+        dcc.Store(id="filters_stats_state"),
+        dcc.Store(id="options_cache", data={}),
+    ]
+)
+
+
 
 
 
 
 #-------------------------------------Section 6---------------------------------------
-
-
-
-
-
-
-# Crash-proof layout assignment (prevents _dash-layout = null on first hit)
-
-import sys, traceback
-from dash import html, dcc
-
-def _fallback_layout(message: str = ""):
-    """Minimal layout so Dash never returns null; message shows in Render logs."""
-    return html.Div(
-        [
-            dcc.Location(id="url"),
-            html.H3("CWB Practice Stats"),
-            html.P("Layout failed to build; check logs."),
-            html.Pre(message, style={"whiteSpace": "pre-wrap", "opacity": 0.6}),
-        ],
-        id="fallback-root",
-        style={"padding": "16px"},
-    )
-
-def _safe_serve_layout():
-    """
-    Wrap the real serve_layout() so any exception still yields a minimal layout.
-    This prevents a blank page when files/paths/env aren't available at startup.
-    """
-    try:
-        if callable(serve_layout):
-            return serve_layout()
-        # If for some reason serve_layout isn't callable, don't crash.
-        return _fallback_layout("serve_layout is not callable at import time.")
-    except Exception:
-        # Log full traceback to stderr so it appears in Render logs.
-        print("[serve_layout] exception:", file=sys.stderr)
-        print(traceback.format_exc(), file=sys.stderr)
-        return _fallback_layout("Exception raised while building layout.")
-
-# IMPORTANT: assign a callable (the safe wrapper), not a static tree.
-app.layout = _safe_serve_layout
-
-
 
 # ---------------- callbacks ----------------
 from datetime import datetime, date
@@ -4344,9 +4193,6 @@ from collections import defaultdict
 from dash import callback, Output, Input, State, no_update
 from uuid import uuid4
 import re, os, json, math, copy
-
-
-
 
 def _parse_date_any(s):
     if not s: return None
@@ -4378,33 +4224,23 @@ def _is_three(x,y):
 # ===== Strict roster name cleaning (uses Section 2 canonicalizer) =====
 _name_token_re = re.compile(r"[A-Za-z']+")
 
-# Never let a name collapse to "" — fall back to the raw string so stats aggregate.
 def _force_to_roster_name(piece: str) -> str:
     s = (piece or "").strip()
     if not s:
         return ""
-    # strict match (e.g., full name already in roster map)
     nm = _strict_canon_name(s)
-    if nm:
-        return nm
-    # loose match on full string
+    if nm: return nm
     nm = _normalize_to_roster(s)
-    if nm and " " in nm:
-        return nm
-    # try adjacent tokens as "First Last"
+    if nm and " " in nm: return nm
     toks = _name_token_re.findall(s)
-    for i in range(len(toks) - 1):
+    for i in range(len(toks)-1):
         cand = f"{toks[i]} {toks[i+1]}"
         nm = _normalize_to_roster(cand)
-        if nm and " " in nm:
-            return nm
-    # last-ditch: single tokens reversed (last name first)
+        if nm and " " in nm: return nm
     for t in reversed(toks):
         nm = _normalize_to_roster(t)
-        if nm and " " in nm:
-            return nm
-    # ▼ critical change: use the raw string instead of "" so stats don’t vanish
-    return s
+        if nm and " " in nm: return nm
+    return ""
 
 def _clean_name_list_to_roster(lst) -> list[str]:
     out, seen = [], set()
@@ -4544,22 +4380,21 @@ def _participants_clean(pbp_src: str, short: str):
 
 
 def _rows_full():
-    """Rows with rich fields for Shooting tab visuals (1 row per logged possession)."""
+    """Shot-only rows (used for Shooting tab visuals)."""
     rows_for_plot = []
-
-    # Load via URL/file-aware cache
-    data = safe_load_data()
-    if not data:
+    if not os.path.exists(DATA_PATH):
         return rows_for_plot
-    if isinstance(data, dict):
-        data = data.get("rows", []) or []
+
+    with open(DATA_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "rows" in data:
+        data = data["rows"]
 
     for rr in (data or []):
-        # --- coords & result ---
         try:
             x = float(rr.get("x")) if str(rr.get("x")).strip() not in ("", "None") else None
             y = float(rr.get("y")) if str(rr.get("y")).strip() not in ("", "None") else None
-        except Exception:
+        except:
             x = y = None
 
         pbp_names_src = (rr.get("play_by_play_names") or "")
@@ -4568,7 +4403,7 @@ def _rows_full():
         short = _row_shorthand_text(rr)
 
         res = rr.get("result") or result_from_shorthand(pbp_raw_src or short or "")
-        if x is None or y is None or not (0 <= x <= COURT_W) or not (0 <= y <= HALF_H) or res not in ("Make", "Miss"):
+        if x is None or y is None or not (0 <= x <= COURT_W) or not (0 <= y <= HALF_H) or res not in ("Make","Miss"):
             continue
 
         idx = rr.get("shot_index") or 1
@@ -4582,8 +4417,6 @@ def _rows_full():
         onball_def_raw = rr.get("defenders") or rr.get("defender") or onball_def_p
         assister_raw = rr.get("assister") or assister_p
         screen_ast_list_raw = rr.get("screen_assisters") or rr.get("screen_assister") or screen_ast_list_p or []
-        if isinstance(screen_ast_list_raw, str):
-            screen_ast_list_raw = [screen_ast_list_raw]
 
         shot_line = _nth_shot_line(pbp_src_for_roles, idx)
         on_actions_shotline  = parse_onball_actions_from_pbp([shot_line], (screen_ast_list_raw[0] if screen_ast_list_raw else ""))
@@ -4612,7 +4445,7 @@ def _rows_full():
 
         try:
             def_label = defense_label_for_shot(pbp_src_for_roles, idx) or "Man to Man"
-        except Exception:
+        except:
             def_label = "Man to Man"
         if "[" in (short or "") and "]" in (short or ""):
             m_zone = re.search(r"\b(\d(?:-\d){1,3})\s*\[", short or "")
@@ -4626,7 +4459,7 @@ def _rows_full():
         rows_for_plot.append({
             **rr,
             "x": x, "y": y, "result": res,
-            "is_three": _is_three(x, y),
+            "is_three": _is_three(x,y),
             "practice_date_str": str(practice),
             "practice_date_obj": _parse_date_any(practice),
             "drill": drill,
@@ -4649,17 +4482,15 @@ def _rows_full():
     return rows_for_plot
 
 
-
 def _rows_stats_all():
-    """Rows (shots or no-shots) for the Stats tab aggregations."""
     rows_for_stats = []
-
-    # Load via URL/file-aware cache
-    data = safe_load_data()
-    if not data:
+    if not os.path.exists(DATA_PATH):
         return rows_for_stats
-    if isinstance(data, dict):
-        data = data.get("rows", []) or []
+
+    with open(DATA_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "rows" in data:
+        data = data["rows"]
 
     for rr in (data or []):
         pbp_names_src = (rr.get("play_by_play_names") or "")
@@ -4674,7 +4505,7 @@ def _rows_stats_all():
         try:
             idx = rr.get("shot_index") or 1
             def_label = defense_label_for_shot(pbp_src_for_roles, idx) or "Man to Man"
-        except Exception:
+        except:
             def_label = "Man to Man"
         if "[" in (short or "") and "]" in (short or ""):
             m_zone = re.search(r"\b(\d(?:-\d){1,3})\s*\[", short or "")
@@ -4689,7 +4520,7 @@ def _rows_stats_all():
         try:
             x = float(rr.get("x")) if str(rr.get("x")).strip() not in ("", "None") else None
             y = float(rr.get("y")) if str(rr.get("y")).strip() not in ("", "None") else None
-        except Exception:
+        except:
             x = y = None
 
         if x is not None and y is not None and 0 <= x <= COURT_W and 0 <= y <= HALF_H:
@@ -4707,8 +4538,6 @@ def _rows_stats_all():
             shooter_raw = rr.get("shooter") or shooter_p or ""
             assister_raw = rr.get("assister") or assister_p or ""
             screen_ast_list_raw = rr.get("screen_assisters") or rr.get("screen_assister") or screen_ast_list_p or []
-            if isinstance(screen_ast_list_raw, str):
-                screen_ast_list_raw = [screen_ast_list_raw]
 
         rows_for_stats.append({
             "practice_date_str": str(practice),
@@ -4726,7 +4555,6 @@ def _rows_stats_all():
             "screen_assisters_raw": screen_ast_list_raw,
         })
     return rows_for_stats
-
 
 
 
@@ -5371,32 +5199,6 @@ def _clear_sel_store(_n):
 
 #------------------------------------Section 8---------------------------------------
 
-
-# --- Boot once: compute rows on first page load and cache them in Stores
-from dash import Output, Input  # (safe to re-import if already imported)
-# If you use ALL/MATCH elsewhere, you may also have: from dash.dependencies import ALL, MATCH
-
-@app.callback(
-    Output("store_rows_full", "data"),
-    Output("store_rows_stats", "data"),
-    Input("boot_once", "n_intervals"),
-    prevent_initial_call=False,   # fire on initial page load
-)
-def _init_boot(_):
-    try:
-        rf = _rows_full() or []
-        rs = _rows_stats_all() or []
-        print(f"[BOOT] rows_full={len(rf)} rows_stats={len(rs)} src={_g('DATA_PATH', DATA_PATH)}")
-        return rf, rs
-    except Exception as e:
-        print(f"[BOOT][ERROR] {e}")
-        return [], []
-
-
-
-
-
-
 # ===== details panel =====
 @app.callback(
     [Output("shot_details", "children"),
@@ -5856,18 +5658,14 @@ def show_shot_details(clickData, close_clicks):
 
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", "8051"))
-    print(f"Starting visualization server on http://localhost:{port}")
+    print("Starting visualization server on http://localhost:8051")
     try:
-        app.run(debug=False, host="0.0.0.0", port=port)
+        app.run(debug=False, port=8051, host="127.0.0.1")
     except Exception as e:
-        print(f"Failed to start server on port {port}: {e}")
-        if port == 8051:
-            fallback_port = 8052
-            print(f"Trying fallback port {fallback_port}...")
-            try:
-                app.run(debug=False, host="0.0.0.0", port=fallback_port)
-            except Exception as e2:
-                print(f"Also failed on port {fallback_port}: {e2}")
-                print("Try running: python vz_mk14.py")
+        print(f"Failed to start server on port 8051: {e}")
+        print("Trying port 8052...")
+        try:
+            app.run(debug=False, port=8052, host="127.0.0.1")
+        except Exception as e2:
+            print(f"Also failed on port 8052: {e2}")
+            print("Try running: python vz_mk1.py")

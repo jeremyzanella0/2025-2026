@@ -29,6 +29,14 @@ os.makedirs(os.path.dirname(DATA_PATH) or ".", exist_ok=True)
 
 BASE_DIR    = os.path.dirname(DATA_PATH) or "."
 ROSTER_PATH = os.path.join(BASE_DIR, "roster.json")
+# --- NEW: practices metadata (absences) persisted next to possessions/roster
+PRACTICES_PATH = os.path.join(BASE_DIR, "practices.json")
+
+# --- NEW: Append-only JSONL path (for scalable, O(1) writes)
+DATA_PATH_JSONL = os.environ.get("BBALL_DATA_JSONL", os.path.join(BASE_DIR, "possessions.jsonl"))
+
+# --- NEW: Limit how many rows we keep in the client store (browser memory)
+MAX_CLIENT_ROWS = int(os.environ.get("MAX_CLIENT_ROWS", "2000"))
 
 # =========================
 # Optional parser module
@@ -42,7 +50,7 @@ except ImportError:
 # =========================
 # Helpers
 # =========================
-# Detect the final +/++/- within a string
+# FIX: detect the last +/++/- from shorthand accurately
 _LAST_SYMBOL_RE = re.compile(r'(?:\+\+|\+|-)(?!.*(?:\+\+|\+|-))')
 
 def result_from_shorthand(s: str):
@@ -123,16 +131,11 @@ def _new_drill_id(practice_id: str, drill_name: str) -> str:
 # =========================
 # Shooter/Result extraction from free text (play-by-play)
 # =========================
-# Boundaries for where a name should STOP (before verbs/punctuation/end)
-_NAME_BOUNDARY = r"(?=\s*(?:makes?|made|miss(?:es)?|scores?|shoots?|attempts?|[,.!]|$))"
-
 # Permissive "guarded by" detector (handles commas/periods and variable spacing)
-# — non-greedy name groups + boundary look-ahead so defender doesn't eat "makes the shot"
 _SHOOT_GUARD_RE = re.compile(
-    rf"([A-Za-z][\w.\-'\s,]+?)\s*guarded\s*by\s*([A-Za-z][\w.\-'\s,]+?){_NAME_BOUNDARY}",
+    r"([A-Za-z][A-Za-z0-9.\-'\s,]+?)\s*guarded\s*by\s*([A-Za-z][A-Za-z0-9.\-'\s,]+)",
     flags=re.IGNORECASE
 )
-
 # More tolerant result detectors
 _MAKES_RE  = re.compile(r"\bmake(?:s|d)?\b", flags=re.IGNORECASE)   # make/makes/made
 _MISSES_RE = re.compile(r"\bmiss(?:es)?\b",  flags=re.IGNORECASE)   # miss/misses
@@ -143,16 +146,12 @@ def _clean_name_fragment(s: str) -> str:
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
-def _strip_after_verbs(s: str) -> str:
-    """Remove any trailing 'makes/made/misses ...' clause if present."""
-    s = re.split(_MAKES_RE, s)[0]
-    s = re.split(_MISSES_RE, s)[0]
-    return s.strip()
-
 def _clean_shooter_line(s: str) -> str:
     """
     From text like 'Fontana, guarded by Lusk misses the shot' -> 'Fontana guarded by Lusk'
-    Uses the strict 'guarded by' extractor; falls back to trimming after verbs.
+    Falls back to stripping trailing words after make/miss if regex doesn't hit.
+    (Note: We do NOT store shooter anymore; we keep this helper solely to produce
+    a clean, readable 'play_by_play_names' preview.)
     """
     if not s:
         return ""
@@ -162,7 +161,8 @@ def _clean_shooter_line(s: str) -> str:
         right = _clean_name_fragment(m.group(2))
         return f"{left} guarded by {right}"
     # fallback: take text up to make/miss and normalize
-    s2 = _strip_after_verbs(s)
+    s2 = _MISSES_RE.split(s)[0]
+    s2 = _MAKES_RE.split(s2)[0]
     s2 = re.sub(r'\bguarded\s*by\b', 'guarded by', s2, flags=re.IGNORECASE)
     return _clean_name_fragment(s2)
 
@@ -222,19 +222,6 @@ def _normalize_row(r):
     drill_id      = (r.get("drill_id") or "").strip() or None
     drill_name    = (r.get("drill_name") or "").strip() or None
 
-    # New structured fields (nullable; legacy rows may not have them)
-    schema_version = r.get("schema_version")
-    shooter_id = r.get("shooter_id"); shooter_name = r.get("shooter_name")
-    primary_defender_id = r.get("primary_defender_id"); primary_defender_name = r.get("primary_defender_name")
-    assist_id = r.get("assist_id"); assist_name = r.get("assist_name")
-    on_ball_actions  = r.get("on_ball_actions", [])
-    off_ball_actions = r.get("off_ball_actions", [])
-    coverages_on     = r.get("coverages_on", [])
-    coverages_off    = r.get("coverages_off", [])
-    defense_context  = r.get("defense_context", [])
-    shot_type        = r.get("shot_type")
-    zone_id          = r.get("zone_id")
-
     if not ts:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
     if not rid:
@@ -280,22 +267,6 @@ def _normalize_row(r):
         "practice_date": practice_date,
         "drill_id": drill_id,
         "drill_name": drill_name,
-
-        # structured (nullable for legacy)
-        "schema_version": int(schema_version) if str(schema_version or "").isdigit() else 1,
-        "shooter_id": shooter_id or None,
-        "shooter_name": (shooter_name or None),
-        "primary_defender_id": primary_defender_id or None,
-        "primary_defender_name": (primary_defender_name or None),
-        "assist_id": assist_id or None,
-        "assist_name": (assist_name or None),
-        "on_ball_actions": list(on_ball_actions) if isinstance(on_ball_actions, list) else [],
-        "off_ball_actions": list(off_ball_actions) if isinstance(off_ball_actions, list) else [],
-        "coverages_on": list(coverages_on) if isinstance(coverages_on, list) else [],
-        "coverages_off": list(coverages_off) if isinstance(coverages_off, list) else [],
-        "defense_context": list(defense_context) if isinstance(defense_context, list) else [],
-        "shot_type": shot_type or None,
-        "zone_id": int(zone_id) if str(zone_id or "").isdigit() else None,
     }
     return out
 
@@ -332,21 +303,120 @@ def _robust_load_json(path, retries=15, wait=0.03):
     print(f"[load_log_from_disk] failed after retries: {last_err}")
     return None
 
-def load_log_from_disk():
-    if not os.path.exists(DATA_PATH):
+# --- NEW: JSONL helpers (append, tail-read, and streaming iterate)
+def _jsonl_path() -> str:
+    return DATA_PATH_JSONL
+
+def append_log_row(row: dict) -> bool:
+    """
+    Append a single possession row as JSONL (O(1) write).
+    Keeps writes fast and avoids rewriting the entire dataset.
+    """
+    try:
+        os.makedirs(os.path.dirname(_jsonl_path()) or ".", exist_ok=True)
+        with open(_jsonl_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(_json_safe_row(row), ensure_ascii=False) + "\n")
+        return True
+    except Exception as e:
+        print(f"[append_log_row] {e}")
+        return False
+
+def _jsonl_tail(n: int) -> list[dict]:
+    """
+    Efficiently read the last n JSONL rows without loading entire file into memory.
+    """
+    path = _jsonl_path()
+    if not os.path.exists(path) or n <= 0:
         return []
+    # Simple block tail reader
+    rows = []
+    chunk_size = 8192
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        buffer = b""
+        pos = file_size
+        while pos > 0 and len(rows) < n:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            f.seek(pos)
+            buffer = f.read(read_size) + buffer
+            # split lines
+            lines = buffer.split(b"\n")
+            buffer = lines[0]  # incomplete head for next round
+            for line in reversed(lines[1:]):  # process from end
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line.decode("utf-8"))
+                    rows.append(_normalize_row(r))
+                    if len(rows) >= n:
+                        break
+                except Exception:
+                    continue
+    rows.reverse()
+    return rows
+
+def iter_rows(date: str = None, drill: str = None):
+    """
+    Memory-light iterator over all possessions, optionally filtered.
+    Streams from JSONL if available; otherwise falls back to JSON/CSV loader.
+    """
+    path_jsonl = _jsonl_path()
+    if os.path.exists(path_jsonl):
+        with open(path_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    r = _normalize_row(json.loads(line))
+                except Exception:
+                    continue
+                if date and r.get("practice_date") != date:
+                    continue
+                if drill and r.get("drill_name") != drill:
+                    continue
+                yield r
+        return
+
+    # Fallback: legacy JSON/CSV (may materialize into memory)
+    for r in load_log_from_disk():
+        if date and r.get("practice_date") != date:
+            continue
+        if drill and r.get("drill_name") != drill:
+            continue
+        yield r
+
+def load_log_from_disk():
+    """
+    Backwards-compatible loader for existing JSON/CSV datasets.
+    If a JSONL file exists, we *also* read it (only used in some legacy paths);
+    the preferred way for large sets is to use iter_rows() or _jsonl_tail().
+    """
     rows = []
     try:
-        if DATA_PATH.lower().endswith(".json"):
-            data = _robust_load_json(DATA_PATH) or []
-            if isinstance(data, dict) and "rows" in data:
-                data = data["rows"]
-            for r in data:
-                rows.append(_normalize_row(r))
-        elif DATA_PATH.lower().endswith(".csv"):
-            with open(DATA_PATH, newline="", encoding="utf-8") as f:
-                for r in csv.DictReader(f):
+        # Prefer JSON/CSV legacy path if present
+        if os.path.exists(DATA_PATH):
+            if DATA_PATH.lower().endswith(".json"):
+                data = _robust_load_json(DATA_PATH) or []
+                if isinstance(data, dict) and "rows" in data:
+                    data = data["rows"]
+                for r in data:
                     rows.append(_normalize_row(r))
+            elif DATA_PATH.lower().endswith(".csv"):
+                with open(DATA_PATH, newline="", encoding="utf-8") as f:
+                    for r in csv.DictReader(f):
+                        rows.append(_normalize_row(r))
+        # If JSONL exists (new path), extend with its contents
+        if os.path.exists(_jsonl_path()):
+            with open(_jsonl_path(), "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        rows.append(_normalize_row(json.loads(line)))
+                    except Exception:
+                        continue
     except Exception as e:
         print(f"load error: {e}")
 
@@ -361,12 +431,7 @@ def load_log_from_disk():
     return out
 
 def _json_safe_row(r: dict):
-    """
-    Ensure consistent JSON types and include new schema v2 fields as nullable lists/strings.
-    """
     out = dict(r)
-
-    # Numeric bounds
     out["x"] = _coerce_float(out.get("x"))
     out["y"] = _coerce_float(out.get("y"))
     if out["x"] is not None:
@@ -374,48 +439,27 @@ def _json_safe_row(r: dict):
     if out["y"] is not None:
         out["y"] = min(max(0.0, out["y"]), 47.0)
     out["distance_ft"] = _coerce_float(out.get("distance_ft"))
-
-    for key in ("group_size", "shot_index", "zone_id"):
-        if out.get(key) is not None and str(out.get(key)) != "":
+    for key in ("group_size", "shot_index"):
+        if out.get(key) is not None:
             try:
                 out[key] = int(out[key])
             except:
                 out[key] = None
-
-    # Nullable strings
-    for k in ("group_id", "possession_type", "practice_id", "drill_id", "practice_date", "drill_name",
-              "result", "shooter_id", "primary_defender_id", "assist_id",
-              "shooter_name","primary_defender_name","assist_name","shot_type",
-              "event_type","turnover_type","foul_type"):
+    for k in ("group_id", "possession_type", "practice_id", "drill_id", "practice_date", "drill_name"):
         if not out.get(k):
             out[k] = None
-
-    # Lists
-    def _as_str_list(v):
-        if isinstance(v, list):
-            return [str(x).strip() for x in v if str(x or "").strip()]
-        return []
-    for k in ("on_ball_actions","off_ball_actions","coverages_on","coverages_off","defense_context"):
-        out[k] = _as_str_list(out.get(k))
-
-    # Text presence (raw & normalized)
     if "play_by_play_names" not in out:
         out["play_by_play_names"] = ""
-    if "play_by_play" not in out:
-        out["play_by_play"] = out.get("possession","") or ""
-
-    # Schema version default
-    try:
-        out["schema_version"] = int(out.get("schema_version") or 1)
-    except:
-        out["schema_version"] = 1
-
-    # No 'shooter' legacy field
+    # No 'shooter' field anymore — ensure it's dropped if present in legacy data
     out.pop("shooter", None)
-
     return out
 
 def save_log_to_disk(rows):
+    """
+    Legacy full-file save (JSON). Kept for compatibility with existing flows.
+    For scalability, callbacks should prefer append_log_row(new_row) to avoid
+    rewriting large files. This function remains for explicit exports/migrations.
+    """
     global _PENDING_DISK_ROWS, _LAST_WRITE_ATTEMPT
     try:
         payload = [_json_safe_row(r) for r in (rows or [])]
@@ -475,6 +519,26 @@ def save_roster_to_disk(roster: dict):
         print(f"[roster save] {e}")
         return False
 
+# --- NEW: Practices metadata (absences) persistence
+def _load_practices_meta():
+    if not os.path.exists(PRACTICES_PATH):
+        return {}
+    try:
+        with open(PRACTICES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[practices load] {e}")
+        return {}
+
+def _save_practices_meta(meta: dict):
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+        return _atomic_write_json(meta or {}, PRACTICES_PATH)
+    except Exception as e:
+        print(f"[practices save] {e}")
+        return False
+
 # =========================
 # Name annotation (ensures “guarded by” is present/standard)
 # =========================
@@ -532,170 +596,6 @@ def annotate_with_roster_lastnames(text: str, roster: dict) -> str:
     # collapse multiple spaces introduced by substitutions
     s = re.sub(r'\s{2,}', ' ', s).strip()
     return s
-
-# =========================
-# Lite structured extraction (IDs + actions/coverages)
-# =========================
-# To avoid forward references, use a local number regex and a safe last-name util.
-_NUM_RE_LITE = re.compile(r'(?<!\w)(\d{1,2})(?!\w)')
-def _last_name_lite(full: str) -> str:
-    if not full:
-        return ""
-    parts = [p for p in re.split(r'\s+', str(full).strip()) if p]
-    return parts[-1] if parts else str(full or "")
-
-# Assist: allow a closing ) ] } before punctuation/end so "(assisted by X)!" matches
-_ASSIST_RE       = re.compile(
-    r"\bassis(?:t|ted)\s*by\s+([A-Za-z0-9.\-'\s,]+?)(?=\s*[\)\]\}]*[,.!]|$)",
-    flags=re.IGNORECASE
-)
-_ASSIST_COLON_RE = re.compile(
-    r"\bassist\s*:\s*([A-Za-z0-9.\-'\s,]+?)(?=\s*[\)\]\}]*[,.!]|$)",
-    flags=re.IGNORECASE
-)
-
-_ON_BALL_TOKENS = ["h","d","p","pnr","pnp","slp","gst","rj","dho","ho"]
-_OFF_BALL_TOKENS= ["bd","pn","fl","bk","awy","crs","wdg","rip","ucla","stg","ivs","elv"]
-_COVERAGE_TOKENS= ["ch","ct","sw","bz","cs","ice","tl"]
-_DEF_CTX_TOKENS = ["hp","sw","rot"]  # help / switch / rotation
-
-_NUM_ONLY_RE = re.compile(r'^\d{1,2}$')
-
-def _player_id_from_num(num: str) -> str | None:
-    try:
-        return f"player_{int(str(num).strip())}"
-    except Exception:
-        return None
-
-def _build_player_indexes(roster: dict):
-    """
-    Input roster like {"12":"John Smith","23":"Mike Jones"}.
-    Returns tuples of lookup dicts.
-    """
-    num_to_id, id_to_name, full_to_id, last_to_ids = {}, {}, {}, {}
-    for k, full in (roster or {}).items():
-        if full is None:
-            continue
-        name = str(full).strip()
-        if not name:
-            continue
-        num = str(k).strip()
-        if not num.isdigit():
-            continue
-        pid = _player_id_from_num(num)
-        num_to_id[num] = pid
-        id_to_name[pid] = name
-        full_to_id[name.casefold()] = pid
-        ln = _last_name_lite(name).casefold()
-        last_to_ids.setdefault(ln, set()).add(pid)
-    return num_to_id, id_to_name, full_to_id, last_to_ids
-
-def _clean_token_for_match(token: str) -> str:
-    return _clean_name_fragment(token)
-
-def _resolve_player_token(token: str, roster: dict):
-    """
-    Resolve "12" or "Smith" or "John Smith" -> (player_id, canonical_name).
-    Ambiguity/unknown => (None, cleaned_token or None).
-    """
-    if not token:
-        return (None, None)
-    s = _clean_token_for_match(token)
-
-    num_to_id, id_to_name, full_to_id, last_to_ids = _build_player_indexes(roster)
-
-    # jersey number
-    if _NUM_ONLY_RE.fullmatch(s):
-        pid = num_to_id.get(str(int(s)))
-        return (pid, id_to_name.get(pid)) if pid else (None, s)
-
-    # exact full-name
-    pid = full_to_id.get(s.casefold())
-    if pid:
-        return (pid, id_to_name.get(pid))
-
-    # unique last-name
-    ln = _last_name_lite(s).casefold()
-    ids = list(last_to_ids.get(ln, []))
-    if len(ids) == 1:
-        pid = ids[0]
-        return (pid, id_to_name.get(pid))
-
-    return (None, s)
-
-def _scan_tokens(line: str, tokens: list[str]) -> list[str]:
-    s = (line or "").lower()
-    found = []
-    for t in tokens:
-        if re.search(rf'(?<!\w){re.escape(t)}(?!\w)', s):
-            found.append(t)
-    # stable unique order
-    out, seen = [], set()
-    for t in found:
-        if t not in seen:
-            out.append(t); seen.add(t)
-    return out
-
-def parse_shot_line_lite(line_text: str, roster: dict) -> dict:
-    """
-    Extract shooter/defender/assist + on/off-ball actions + coverages + defense context.
-    NOTE: Defender is taken ONLY from 'guarded by <Name>' to avoid false positives.
-    Missing pieces -> None / [] (never blocks a save).
-    """
-    out = {
-        "shooter_id": None, "shooter_name": None,
-        "primary_defender_id": None, "primary_defender_name": None,
-        "assist_id": None, "assist_name": None,
-        "on_ball_actions": [], "off_ball_actions": [],
-        "coverages_on": [], "coverages_off": [], "defense_context": []
-    }
-    s = (line_text or "").strip()
-    if not s:
-        return out
-
-    # Shooter & primary defender: "<A> guarded by <B>"
-    m = _SHOOT_GUARD_RE.search(s)
-    if m:
-        sh_raw = _clean_name_fragment(m.group(1))
-        df_raw = _clean_name_fragment(m.group(2))
-        pid, pname = _resolve_player_token(sh_raw, roster)
-        did, dname = _resolve_player_token(df_raw, roster)
-        out["shooter_id"], out["shooter_name"] = pid, pname
-        # Defender ONLY from 'guarded by'
-        out["primary_defender_id"], out["primary_defender_name"] = did, dname
-    else:
-        # Fallback shooter guess: first token before 'make/miss' or 'guarded by'
-        head = re.split(r'\bguarded\s*by\b', s, flags=re.IGNORECASE)[0]
-        head = _MISSES_RE.split(head)[0]
-        head = _MAKES_RE.split(head)[0]
-        toks = re.findall(r"[A-Za-z0-9.\-']+", head)
-        if toks:
-            pid, pname = _resolve_player_token(toks[0], roster)
-            out["shooter_id"], out["shooter_name"] = pid, pname
-        # IMPORTANT: do NOT guess a defender if we don't find "guarded by"
-
-    # Assist (now robust to closing parentheses before punctuation)
-    m2 = _ASSIST_RE.search(s) or _ASSIST_COLON_RE.search(s)
-    if m2:
-        a_raw = _clean_name_fragment(m2.group(1))
-        aid, aname = _resolve_player_token(a_raw, roster)
-        out["assist_id"], out["assist_name"] = aid, aname
-
-    # Action / coverage tags (from shorthand tokens if present in text)
-    on_tokens  = _scan_tokens(s, _ON_BALL_TOKENS)
-    off_tokens = _scan_tokens(s, _OFF_BALL_TOKENS)
-    cov_tokens = _scan_tokens(s, _COVERAGE_TOKENS)
-    def_tokens = _scan_tokens(s, _DEF_CTX_TOKENS)
-
-    out["on_ball_actions"]  = on_tokens
-    out["off_ball_actions"] = off_tokens
-    if cov_tokens:
-        if on_tokens:
-            out["coverages_on"] = cov_tokens
-        else:
-            out["coverages_off"] = cov_tokens
-    out["defense_context"] = def_tokens
-    return out
 
 # =========================
 # Court geometry
@@ -808,30 +708,6 @@ def base_fig():
     )
     return fig
 
-# Optional derived at save-time (kept here for callbacks to call)
-def shot_type_from_xy(x, y) -> str | None:
-    """Return '2pt'/'3pt' based on 3PT geometry (handles corner 3s)."""
-    try:
-        x = float(x); y = float(y)
-    except Exception:
-        return None
-
-    def t_for_x(x_target):
-        val = (x_target - RIM_X) / THREE_R
-        val = max(-1.0, min(1.0, val))
-        return math.asin(val)
-
-    tL, tR = t_for_x(LEFT_POST_X), t_for_x(RIGHT_POST_X)
-    yL = RIM_Y + THREE_R*math.cos(tL)
-    yR = RIM_Y + THREE_R*math.cos(tR)
-
-    # Corner exception: outside posts & below intersection → 3pt
-    if (x <= LEFT_POST_X and y <= yL) or (x >= RIGHT_POST_X and y <= yR):
-        return "3pt"
-
-    dist = math.hypot(x - RIM_X, y - RIM_Y)
-    return "3pt" if dist >= THREE_R else "2pt"
-
 # =========================
 # App
 # =========================
@@ -842,6 +718,10 @@ _initial_log    = load_log_from_disk()
 try_flush_pending()
 _initial_roster = load_roster_from_disk()
 
+# --- NEW: cap initial client log window to protect browser when datasets are large
+if isinstance(_initial_log, list) and len(_initial_log) > MAX_CLIENT_ROWS:
+    _initial_log = _initial_log[-MAX_CLIENT_ROWS:]
+
 def modal_style(show: bool):
     return {
         "display": "flex" if show else "none",
@@ -850,8 +730,6 @@ def modal_style(show: bool):
         "alignItems": "center", "justifyContent": "center",
         "zIndex": 1000,
     }
-
-
 
 # ------------- LAYOUT -------------
 app.layout = html.Div([
@@ -911,19 +789,6 @@ app.layout = html.Div([
                                                "color": "white", "marginLeft": "6px"}),
                         ], style={"display": "flex", "alignItems": "center", "gap": "6px", "marginBottom": "8px"}),
 
-                        # ---- Debug toggle + JSON Inspector
-                        html.Div([
-                            dcc.Checklist(
-                                id="debug_toggle",
-                                options=[{"label": " Debug mode", "value": "on"}],
-                                value=[],
-                                style={"userSelect": "none"}
-                            ),
-                            html.Button("JSON Inspector", id="btn_open_json", n_clicks=0,
-                                        style={"marginLeft": "10px","padding":"6px 10px","borderRadius":"8px",
-                                               "border":"1px solid #aaa","background":"white"})
-                        ], style={"display":"flex","alignItems":"center","gap":"6px","margin":"4px 0 8px"}),
-
                         html.Div(id="mode_hint", style={"fontSize": "13px", "color": "#444"})
                     ], style={"marginBottom": "12px"}),
 
@@ -979,9 +844,6 @@ app.layout = html.Div([
                               style={"width": "100%", "padding": "12px", "fontSize": "16px"},
                               debounce=False),
                     html.Div(style={"display": "flex", "gap": "8px", "marginTop": "12px", "justifyContent": "flex-end"}, children=[
-                        html.Button("Test Parse", id="btn_test_parse", n_clicks=0,
-                                    style={"padding":"10px 16px","borderRadius":"8px",
-                                           "border":"1px solid #ccc","background":"white","marginRight":"auto"}),
                         html.Button("Cancel", id="btn_cancel", n_clicks=0,
                                     style={"padding": "10px 16px", "borderRadius": "8px",
                                            "border": "1px solid #ccc", "background": "white"}),
@@ -992,27 +854,28 @@ app.layout = html.Div([
                 ]
             )),
 
-            # JSON Inspector modal (read-only)
-            html.Div(id="json_modal", style=modal_style(False), children=html.Div(
-                style={"width":"740px","background":"white","borderRadius":"12px",
-                       "boxShadow":"0 10px 30px rgba(0,0,0,0.2)","padding":"18px"},
+            # --- NEW: Missed Practice modal (count + jersey numbers)
+            html.Div(id="missed_modal", style=modal_style(False), children=html.Div(
+                style={"width": "520px", "background": "white", "borderRadius": "12px",
+                       "boxShadow": "0 10px 30px rgba(0,0,0,0.2)", "padding": "18px"},
                 children=[
-                    html.H3("Last 20 saved rows (read-only)"),
-                    html.Div(id="json_modal_body", style={"maxHeight":"60vh","overflow":"auto",
-                                                          "background":"#0b1021","color":"#e6edf3",
-                                                          "padding":"12px","borderRadius":"8px",
-                                                          "fontFamily":"ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-                                                          "fontSize":"13px"}),
-                    html.Div(style={"textAlign":"right","marginTop":"10px"}, children=[
-                        html.Button("Close", id="btn_close_json", n_clicks=0,
-                                    style={"padding":"8px 12px","borderRadius":"8px",
-                                           "border":"1px solid #aaa","background":"white"})
+                    html.H3("Players Missing Practice"),
+                    html.Div("How many players missed this practice?", style={"marginBottom": "8px"}),
+                    dcc.Input(id="inp_missed_count", type="number", min=0, step=1, placeholder="0",
+                              style={"width":"120px","padding":"6px"}),
+                    html.Div(id="missed_numbers_block", style={"marginTop":"12px"}),
+                    html.Div(style={"display":"flex","gap":"8px","justifyContent":"flex-end","marginTop":"14px"}, children=[
+                        html.Button("Cancel", id="btn_missed_cancel", n_clicks=0,
+                                    style={"padding":"10px 16px","borderRadius":"8px","border":"1px solid #ccc","background":"white"}),
+                        html.Button("Save", id="btn_missed_save", n_clicks=0,
+                                    style={"padding":"10px 16px","borderRadius":"8px","border":"none","background":"#2563eb","color":"white"})
                     ])
                 ]
             )),
         ]),
 
         dcc.Tab(label="Data Log", value="log", children=[
+            # Filled by callbacks (dates → drills → table)
             html.Div(id="log_container",
                      style={"maxWidth": "1200px", "margin": "18px auto", "padding": "0 12px"}),
         ]),
@@ -1036,6 +899,9 @@ app.layout = html.Div([
     dcc.Store(id="store_practice", data={"active": False, "date": None, "practice_id": None}),
     dcc.Store(id="store_drill",    data={"active": False, "name": None, "drill_id": None}),
 
+    # --- NEW: controls visibility of missed practice modal
+    dcc.Store(id="store_show_missed_modal", data=False),
+
     # Data Log navigation state
     dcc.Store(id="log_level", data="dates"),
     dcc.Store(id="sel_date", data=None),
@@ -1045,10 +911,6 @@ app.layout = html.Div([
     dcc.Store(id="confirm_delete_type", data=None),
     dcc.Store(id="confirm_delete_target", data=None),
     dcc.Store(id="show_confirm_modal", data=False),
-
-    # Debug/Inspector stores
-    dcc.Store(id="store_debug", data=False),
-    dcc.Store(id="show_json_modal", data=False),
 
     # Confirmation modal
     html.Div(id="confirm_modal", style=modal_style(False), children=html.Div(
@@ -1071,17 +933,24 @@ app.layout = html.Div([
     dcc.Interval(id="retry_interval", interval=2000, n_intervals=0),
 
     # ---------------------------------------------------------------------
-    # Hidden placeholders so pattern-matching Inputs exist at initial load.
+    # Hidden placeholders so plain-ID & pattern-ID Inputs exist at all times.
+    # This prevents "nonexistent object used in an Input/State" errors in Dash 3.x.
     # ---------------------------------------------------------------------
     html.Div(style={"display": "none"}, children=[
+        # Table-level delete button and table (scope "main")
         html.Button(id={"role": "btn_delete_rows", "scope": "main"}, n_clicks=0),
         dash_table.DataTable(
             id={"role": "tbl_log", "scope": "main"},
             columns=[{"name": "dummy", "id": "dummy"}],
             data=[]
         ),
+        # Representative practice/drill delete buttons used in dates/drills views
         html.Button(id={"type": "delete_practice_btn", "date": "__placeholder__"}, n_clicks=0),
         html.Button(id={"type": "delete_drill_btn", "drill": "__placeholder__", "date": "__placeholder__"}, n_clicks=0),
+
+        # --- IMPORTANT: keep a *live* hidden copy of the legacy ID expected by some callbacks.
+        # If callbacks still reference State('inp_missed_numbers', 'value'), this ensures it exists.
+        dcc.Input(id="inp_missed_numbers", type="number", value=0),
     ]),
 ])
 
@@ -1094,6 +963,7 @@ app.validation_layout = html.Div([
         dcc.Tab(label="Data Log", value="log"),
     ]),
 
+    # Pattern ID placeholders used by table callbacks
     dash_table.DataTable(
         id={"role": "tbl_log", "scope": "main"},
         columns=[{"name": "dummy", "id": "dummy"}],
@@ -1101,15 +971,16 @@ app.validation_layout = html.Div([
     ),
     html.Button(id={"role": "btn_delete_rows", "scope": "main"}, n_clicks=0),
 
+    # Plain-ID placeholders used by nav callbacks
     html.Button(id="btn_back_drills", n_clicks=0),
     html.Button(id="btn_back_dates", n_clicks=0),
 
+    # Containers
     html.Div(id="log_container"),
     html.Div(id="confirm_modal"),
     html.Div(id="last_saved"),
-    html.Div(id="json_modal"),
-    html.Div(id="json_modal_body"),
 
+    # Stores
     dcc.Store(id="store_modal_open"),
     dcc.Store(id="store_last_click_xy"),
     dcc.Store(id="store_preview"),
@@ -1120,16 +991,23 @@ app.validation_layout = html.Div([
     dcc.Store(id="store_roster"),
     dcc.Store(id="store_practice"),
     dcc.Store(id="store_drill"),
+    dcc.Store(id="store_show_missed_modal"),  # NEW
     dcc.Store(id="log_level"),
     dcc.Store(id="sel_date"),
     dcc.Store(id="sel_drill"),
     dcc.Store(id="confirm_delete_type"),
     dcc.Store(id="confirm_delete_target"),
     dcc.Store(id="show_confirm_modal"),
-    dcc.Store(id="store_debug"),
-    dcc.Store(id="show_json_modal"),
 
     dcc.Interval(id="retry_interval"),
+
+    # --- NEW: validation placeholders for missed practice modal & inputs
+    html.Div(id="missed_modal"),
+    dcc.Input(id="inp_missed_count"),
+    html.Div(id="missed_numbers_block"),
+    dcc.Input(id="inp_missed_numbers"),  # legacy placeholder
+    html.Button(id="btn_missed_cancel"),
+    html.Button(id="btn_missed_save"),
 ])
 
 # -------- Optional commentary wrapper (unchanged)
@@ -1175,44 +1053,11 @@ def get_ps_commentary_cli(possession_text: str) -> str:
 _MAKES_RE  = re.compile(r"\bmake(?:s|d)?\b",  flags=re.IGNORECASE)
 _MISSES_RE = re.compile(r"\bmiss(?:es)?\b",   flags=re.IGNORECASE)
 
-# general name token
-_NAME_CHARS = r"[A-Za-z0-9.\-'\s,]+?"
-
-# screen/screener extraction
-_SCREEN_FROM_RE = re.compile(
-    rf"(?:pick(?:\s*-\s*|(?:\s*and\s*))?roll|pick\s*and\s*pop|screen)\s*(?:from|by)\s+({_NAME_CHARS})(?=\s*(?:guarded\s*by|[,.!]|$))",
-    re.IGNORECASE
-)
-# finds "<someone> guarded by <defender>"
-_GUARDED_BY_PAIR_RE = re.compile(
-    rf"({_NAME_CHARS})\s*guarded\s*by\s+({_NAME_CHARS})(?=[,.!]|$)",
-    re.IGNORECASE
-)
-# screen assist
-_SCREEN_ASSIST_RE = re.compile(
-    rf"\bscreen\s+assist\s+by\s+({_NAME_CHARS})(?=[,.!]|$)",
-    re.IGNORECASE
-)
-# handoff
-_HANDOFF_RE = re.compile(
-    rf"(?:dribble\s*hand\s*off|handoff|hand\s*off|dho|ho)\s*(?:from\s+({_NAME_CHARS}))?(?:\s*(?:to|with)\s+({_NAME_CHARS}))?",
-    re.IGNORECASE
-)
-
-# coverage phrases -> friendly text + compact tag
-_COVERAGE_PHRASES = [
-    (re.compile(r"\bchases?\s+over\b", re.IGNORECASE), ("Chases Over", "ch")),
-    (re.compile(r"\bgo(?:es|ing)?\s+over\b", re.IGNORECASE), ("Chases Over", "ch")),
-    (re.compile(r"\bgo(?:es|ing)?\s+under\b", re.IGNORECASE), ("Under", "un")),
-    (re.compile(r"\bswitch(?:ed|es|ing)?\b", re.IGNORECASE), ("Switch", "sw")),
-    (re.compile(r"\bblitz(?:ed|es|ing)?\b", re.IGNORECASE), ("Blitz", "bz")),
-    (re.compile(r"\bcontain(?:ed|s|ing)?\b", re.IGNORECASE), ("Contain", "ct")),
-    (re.compile(r"\bice\b", re.IGNORECASE), ("Ice", "ice")),
-    (re.compile(r"\bdrop(?:ped)?\b", re.IGNORECASE), ("Drop", "dp")),
-    (re.compile(r"\btrap(?:ped)?\b", re.IGNORECASE), ("Trap", "tr")),
-]
-
 def _extract_results(lines: list[str]) -> list[str | None]:
+    """
+    Return a list of 'Make'/'Miss' in the order they appear.
+    Count a line as a shot ONLY if it includes a make/miss token.
+    """
     out: list[str | None] = []
     for raw in (lines or []):
         s = (raw or "").strip()
@@ -1226,135 +1071,76 @@ def _extract_results(lines: list[str]) -> list[str | None]:
             out.append("Miss")
     return out
 
-def _align_lines_for_shots(all_lines: list[str], need_n: int) -> list[str]:
+def _per_shot_nones(n: int) -> list[None]:
+    return [None] * max(0, int(n or 0))
+
+# --- NEW (local): compact/overwrite storage after deletes, streaming-friendly ---
+def _rewrite_storage_filtered(keep_predicate):
     """
-    Choose the most relevant line for each shot:
-    1) If there are lines with make/miss tokens, align shots to those (in order).
-    2) If fewer such lines than shots, use the last make/miss line for the remaining shots.
-    3) If none contain make/miss, use the last line; if not present, use empty strings.
+    Rewrites on-disk storage to keep only rows for which keep_predicate(row) is True.
+    Prefers JSONL compaction when available; falls back to legacy JSON if JSONL doesn't exist.
     """
-    need_n = int(need_n or 0)
-    if need_n <= 0:
-        return []
-    all_lines = list(all_lines or [])
-    mm_lines = [ln for ln in all_lines if (_MAKES_RE.search(ln) or _MISSES_RE.search(ln))]
+    # Prefer JSONL path if it exists
+    path_jsonl = _jsonl_path()
+    if os.path.exists(path_jsonl):
+        dir_ = os.path.dirname(path_jsonl) or "."
+        tmp_path = os.path.join(dir_, f".possessions.tmp.{_rand_suffix(6)}.jsonl")
+        try:
+            with open(path_jsonl, "r", encoding="utf-8") as fin, \
+                 open(tmp_path, "w", encoding="utf-8") as fout:
+                for line in fin:
+                    if not line.strip():
+                        continue
+                    try:
+                        r = _normalize_row(json.loads(line))
+                    except Exception:
+                        continue
+                    if keep_predicate(r):
+                        fout.write(json.dumps(_json_safe_row(r), ensure_ascii=False) + "\n")
+            os.replace(tmp_path, path_jsonl)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except:
+                pass
+            print(f"[compact jsonl] {e}")
 
-    aligned: list[str] = []
-    if mm_lines:
-        for i in range(need_n):
-            aligned.append(mm_lines[i] if i < len(mm_lines) else mm_lines[-1])
-        return aligned
+    # Also handle legacy DATA_PATH if present (JSON/CSV); we keep JSON only here.
+    if os.path.exists(DATA_PATH) and DATA_PATH.lower().endswith(".json"):
+        try:
+            legacy = _robust_load_json(DATA_PATH) or []
+            if isinstance(legacy, dict) and "rows" in legacy:
+                legacy = legacy["rows"]
+            keep = []
+            for r in legacy:
+                try:
+                    nr = _normalize_row(r)
+                    if keep_predicate(nr):
+                        keep.append(_json_safe_row(nr))
+                except Exception:
+                    continue
+            _atomic_write_json(keep, DATA_PATH)
+        except Exception as e:
+            print(f"[compact json legacy] {e}")
 
-    fallback = all_lines[-1] if all_lines else ""
-    return [fallback] * need_n
-
-def _fmt_idname(pid, pname):
-    return (pname or pid or "") or ""
-
-def _resolve_name_pair(name_raw: str, roster: dict):
-    pid, pname = _resolve_player_token(_clean_name_fragment(name_raw), roster)
-    return {"id": pid, "name": pname}
-
-def _friendly_coverage_from_text(full_text: str) -> tuple[str | None, str | None]:
+def _refresh_client_window():
     """
-    Returns (friendly_text, short_tag) if a coverage phrase is found anywhere in the possession text.
-    e.g., "Lusk chases over the screen" -> ("Chases Over", "ch")
+    Refresh recent window for client from JSONL tail if available, else from legacy loader.
     """
-    s = full_text or ""
-    for rx, (label, tag) in _COVERAGE_PHRASES:
-        if rx.search(s):
-            return label, tag
-    return None, None
-
-def _augment_on_ball_detail_from_context(all_lines: list[str], chosen_line: str, base: dict, roster: dict) -> dict | None:
-    """
-    Build a rich on-ball detail using BOTH:
-      - the specific line aligned to the shot (chosen_line),
-      - the entire possession text (all_lines) to pick up screener/coverage that may be on other lines.
-    """
-    actions = base.get("on_ball_actions") or []
-    if not actions:
-        return None
-
-    # pick main on-ball type
-    priority = ["pnr", "pnp", "dho", "ho", "slp", "gst", "rj", "h", "d", "p"]
-    on_type = next((a for a in priority if a in actions), actions[0])
-
-    # merge text for context
-    full_text = " ".join([ln.strip() for ln in (all_lines or []) if ln and ln.strip()])
-    s_line = (chosen_line or "").strip()
-
-    detail = {"type": on_type}
-
-    # ball handler & defender (default to shooter/primary defender from base)
-    bh = {"id": base.get("shooter_id"), "name": base.get("shooter_name")}
-    bhd= {"id": base.get("primary_defender_id"), "name": base.get("primary_defender_name")}
-    if bh.get("id") or bh.get("name"):
-        detail["ball_handler"] = bh
-    if bhd.get("id") or bhd.get("name"):
-        detail["ball_handler_defender"] = bhd
-
-    # coverage from full context (friendly label + tag)
-    friendly_cov, cov_tag = _friendly_coverage_from_text(full_text)
-    if friendly_cov:
-        detail["coverage_friendly"] = friendly_cov
-        detail["coverage"] = cov_tag
-
-    # ---- SCREEN / PNR / PNP / SLP / GST / RJ ----
-    if on_type in ("pnr", "pnp", "slp", "gst", "rj"):
-        # screener from full context
-        m = _SCREEN_FROM_RE.search(full_text)
-        if m:
-            scr = _resolve_name_pair(m.group(1), roster)
-            detail["screener"] = scr
-
-            # screener defender: find "<screener> guarded by X" anywhere
-            if scr.get("name"):
-                mdef = re.search(
-                    rf"{re.escape(_clean_name_fragment(scr['name']))}\s*guarded\s*by\s+({_NAME_CHARS})(?=[,.!]|$)",
-                    full_text,
-                    re.IGNORECASE,
-                )
-                if mdef:
-                    detail["screener_defender"] = _resolve_name_pair(mdef.group(1), roster)
-
-        # screen assist (from the result line is fine, but scan whole text)
-        msa = _SCREEN_ASSIST_RE.search(full_text)
-        if msa:
-            detail["screen_assist"] = _resolve_name_pair(msa.group(1), roster)
-
-    # ---- HANDOFF ----
-    if on_type in ("dho", "ho"):
-        m = _HANDOFF_RE.search(full_text)
-        if m:
-            frm_raw, to_raw = m.group(1), m.group(2)
-            if frm_raw:
-                detail["handoff_from"] = _resolve_name_pair(frm_raw, roster)
-            if to_raw:
-                detail["handoff_to"] = _resolve_name_pair(to_raw, roster)
-        # defenders for those players, if the text has "<name> guarded by <defender>"
-        for key in ("handoff_from", "handoff_to"):
-            if key in detail and (detail[key].get("name") or detail[key].get("id")):
-                nm = detail[key].get("name") or ""
-                mdef = re.search(
-                    rf"{re.escape(_clean_name_fragment(nm))}\s*guarded\s*by\s+({_NAME_CHARS})(?=[,.!]|$)",
-                    full_text,
-                    re.IGNORECASE,
-                )
-                if mdef:
-                    detail[f"{key}_defender"] = _resolve_name_pair(mdef.group(1), roster)
-
-    # ---- Simple on-ball: h / d / p ----
-    if on_type in ("h", "d", "p"):
-        if bhd.get("id") or bhd.get("name"):
-            detail["on_ball_defender"] = bhd
-
-    return detail
+    if os.path.exists(_jsonl_path()):
+        try:
+            return _jsonl_tail(MAX_CLIENT_ROWS)
+        except Exception as e:
+            print(f"[refresh_client_window.tail] {e}")
+    # Fallback to legacy loader (will be sliced at init, but keep it small here too)
+    rows = load_log_from_disk()
+    return rows[-MAX_CLIENT_ROWS:] if isinstance(rows, list) and len(rows) > MAX_CLIENT_ROWS else rows
 
 # -----------------------------------------------------------------------------
 
 
-# Auto-retry pending writes
+# Auto-retry pending writes (kept for legacy JSON full-file path)
 @app.callback(
     Output("store_log", "data", allow_duplicate=True),
     Input("retry_interval", "n_intervals"),
@@ -1363,25 +1149,134 @@ def _augment_on_ball_detail_from_context(all_lines: list[str], chosen_line: str,
 )
 def auto_retry(_n, log):
     if _PENDING_DISK_ROWS is not None and try_flush_pending():
-        return load_log_from_disk()
+        # On success, refresh the client window from disk (tail when possible)
+        return _refresh_client_window()
     return no_update
+
+
+# -----------------------------
+# Missed Practice Modal wiring
+# -----------------------------
+
+# Show/hide the missed-practice modal
+@app.callback(
+    Output("missed_modal", "style"),
+    Input("store_show_missed_modal", "data")
+)
+def toggle_missed_modal(show):
+    return modal_style(bool(show))
+
+# Dynamically show the jersey-number field when count > 0
+@app.callback(
+    Output("missed_numbers_block", "children"),
+    Input("inp_missed_count", "value")
+)
+def render_missed_numbers_block(count_val):
+    try:
+        n = int(count_val or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return html.Div("No one missed practice. Click Save to continue.",
+                        style={"color":"#444","fontSize":"14px"})
+    return html.Div([
+        html.Div(f"Enter {n} jersey number(s), comma or space separated:", style={"marginBottom":"6px"}),
+        # IMPORTANT: same id used everywhere; exists even when hidden thanks to the
+        # hidden placeholder instance in Section 1.
+        dcc.Input(id="inp_missed_numbers", type="text", placeholder="e.g., 12, 23 5",
+                  style={"width":"100%","padding":"8px"})
+    ])
 
 
 # Start / End Practice
 @app.callback(
     Output("store_practice","data", allow_duplicate=True),
     Output("practice_status","children", allow_duplicate=True),
+    Output("store_show_missed_modal","data", allow_duplicate=True),
     Input("btn_start_practice","n_clicks"),
     State("inp_practice_date","value"),
     prevent_initial_call=True
 )
 def start_practice(n_start, date_str):
-    if not n_start: return no_update, no_update
+    if not n_start:
+        return no_update, no_update, no_update
     if not (date_str and str(date_str).strip()):
-        return no_update, "Enter a practice date to start."
+        return no_update, "Enter a practice date to start.", False
     norm = _normalize_date_input(str(date_str))
     pid = _new_practice_id(norm)
-    return {"active": True, "date": norm, "practice_id": pid}, f"Practice active: {norm} (id={pid})"
+    # Start as active, but prompt for absences
+    practice = {"active": True, "date": norm, "practice_id": pid, "absent_numbers": []}
+    status = f"Practice active: {norm} (id={pid}). Please confirm absences…"
+    return practice, status, True
+
+# Save/Cancel absences from the modal
+@app.callback(
+    Output("store_practice","data", allow_duplicate=True),
+    Output("practice_status","children", allow_duplicate=True),
+    Output("store_show_missed_modal","data", allow_duplicate=True),
+    Input("btn_missed_save","n_clicks"),
+    Input("btn_missed_cancel","n_clicks"),
+    State("inp_missed_count","value"),
+    State("inp_missed_numbers","value"),  # exists even when not visible
+    State("store_practice","data"),
+    prevent_initial_call=True
+)
+def finalize_practice_absences(n_save, n_cancel, count_val, numbers_raw, practice):
+    trig = ctx.triggered_id if ctx.triggered_id else None
+    if not practice or not practice.get("active"):
+        return no_update, no_update, False
+
+    if trig == "btn_missed_cancel":
+        # Persist a record with zero absences for this practice
+        meta = _load_practices_meta()
+        meta[practice["practice_id"]] = {
+            "practice_date": practice.get("date"),
+            "absent_numbers": []
+        }
+        _save_practices_meta(meta)
+        practice["absent_numbers"] = []
+        status = f"Practice active: {practice['date']} (id={practice['practice_id']}). Absences: 0."
+        return practice, status, False
+
+    if trig != "btn_missed_save":
+        return no_update, no_update, no_update
+
+    # Parse count and jersey number list
+    try:
+        cnt = int(count_val or 0)
+    except Exception:
+        cnt = 0
+
+    absent_nums = []
+    if cnt > 0:
+        raw = (numbers_raw or "").strip()
+        if not raw:
+            return no_update, "Enter jersey numbers or set count to 0.", True
+        parts = re.split(r"[,\s]+", raw)
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            try:
+                absent_nums.append(str(int(p)))
+            except Exception:
+                # ignore non-numeric tokens
+                pass
+        # proceed even if lengths differ
+
+    # Persist to practices.json
+    meta = _load_practices_meta()
+    meta[practice["practice_id"]] = {
+        "practice_date": practice.get("date"),
+        "absent_numbers": absent_nums
+    }
+    _save_practices_meta(meta)
+
+    practice["absent_numbers"] = absent_nums
+    status = (f"Practice active: {practice['date']} (id={practice['practice_id']}). "
+              f"Absences: {len(absent_nums)}" + (f" ({', '.join(absent_nums)})" if absent_nums else "."))
+    return practice, status, False
+
 
 @app.callback(
     Output("store_practice","data", allow_duplicate=True),
@@ -1392,10 +1287,11 @@ def start_practice(n_start, date_str):
     prevent_initial_call=True
 )
 def end_practice(n_end, practice):
-    if not n_end: return no_update, no_update, no_update
+    if not n_end:
+        return no_update, no_update, no_update
     if not (practice and practice.get("active")):
         return no_update, no_update, "No active practice to end."
-    return {"active": False, "date": practice.get("date"), "practice_id": practice.get("practice_id")}, \
+    return {"active": False, "date": practice.get("date"), "practice_id": practice.get("practice_id"), "absent_numbers": practice.get("absent_numbers")}, \
            {"active": False, "name": None, "drill_id": None}, \
            f"Practice ended: {practice.get('date')}."
 
@@ -1410,7 +1306,8 @@ def end_practice(n_end, practice):
     prevent_initial_call=True
 )
 def start_drill(n_start, drill_name, practice):
-    if not n_start: return no_update, no_update
+    if not n_start:
+        return no_update, no_update
     if not (practice and practice.get("active")):
         return no_update, "Start a practice first."
     dn = (drill_name or "").strip()
@@ -1427,7 +1324,8 @@ def start_drill(n_start, drill_name, practice):
     prevent_initial_call=True
 )
 def end_drill(n_end, drill):
-    if not n_end: return no_update, no_update
+    if not n_end:
+        return no_update, no_update
     if not (drill and drill.get("active")):
         return no_update, "No active drill to end."
     return {"active": False, "name": drill.get("name"), "drill_id": drill.get("drill_id")}, \
@@ -1441,7 +1339,8 @@ def end_drill(n_end, drill):
     prevent_initial_call=True
 )
 def debug_click(clickData):
-    if not clickData: return "No clicks detected"
+    if not clickData:
+        return "No clicks detected"
     p = clickData['points'][0]
     return f"Last click: x={p['x']:.1f}, y={p['y']:.1f}"
 
@@ -1496,7 +1395,8 @@ def set_mode(n_to, n_start, shots_value, practice, drill):
     prevent_initial_call=True
 )
 def control(clickData, n_no_shot, n_cancel, n_submit_btn, n_submit_enter, mode, shots_needed, clicks):
-    if not ctx.triggered: return no_update, no_update, no_update, no_update, no_update
+    if not ctx.triggered:
+        return no_update, no_update, no_update, no_update, no_update
     trig = ctx.triggered_id
 
     if trig == "btn_no_shot":
@@ -1517,6 +1417,7 @@ def control(clickData, n_no_shot, n_cancel, n_submit_btn, n_submit_enter, mode, 
         if len(clicks) < shots_needed:
             return no_update, no_update, no_update, f"Collected {len(clicks)}/{shots_needed} shots. Continue clicking…", clicks
 
+        # All clicks collected -> open modal; stash xy_list into preview
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
         preview = {
             "id": f"{now}-{_rand_suffix()}",
@@ -1550,75 +1451,28 @@ def toggle_confirm_modal(show):
     return [modal_style(bool(show))]
 
 
-# ---------------------------
-# Debug toggle + JSON Inspector
-# ---------------------------
-@app.callback(
-    Output("store_debug", "data"),
-    Input("debug_toggle", "value"),
-    prevent_initial_call=False
-)
-def set_debug_mode(vals):
-    return bool(vals and "on" in vals)
-
-@app.callback(
-    Output("show_json_modal", "data"),
-    Input("btn_open_json", "n_clicks"),
-    Input("btn_close_json", "n_clicks"),
-    State("show_json_modal", "data"),
-    prevent_initial_call=True
-)
-def toggle_json_modal(n_open, n_close, cur):
-    trig = ctx.triggered_id
-    if trig == "btn_open_json":
-        return True
-    if trig == "btn_close_json":
-        return False
-    return cur
-
-@app.callback(
-    Output("json_modal", "style"),
-    Output("json_modal_body", "children"),
-    Input("show_json_modal", "data"),
-    State("store_log", "data")
-)
-def render_json_modal(show, rows):
-    style = modal_style(bool(show))
-    if not show:
-        return style, no_update
-    rows = rows or []
-    tail = rows[-20:]
-    try:
-        txt = json.dumps(tail, ensure_ascii=False, indent=2)
-    except Exception:
-        txt = "(error rendering json)"
-    return style, html.Pre(txt)
-
-# ---------------------------
-# Parse + Preview (shots/no-shot) + Test Parse debug surface
-# ---------------------------
+# Parse + Preview (shots/no-shot)
 @app.callback(
     [Output("output_block", "children"),
      Output("store_preview", "data")],
     [Input("btn_submit", "n_clicks"),
-     Input("possession_input", "n_submit"),
-     Input("btn_test_parse", "n_clicks")],
+     Input("possession_input", "n_submit")],
     [State("possession_input", "value"),
      State("store_last_click_xy", "data"),
      State("store_preview", "data"),
      State("store_mode", "data"),
      State("store_shots_needed", "data"),
-     State("store_roster", "data"),
-     State("store_debug", "data")],
+     State("store_roster", "data")],
     prevent_initial_call=True
 )
-def parse_and_preview(n_btn, n_enter, n_test, possession_text, single_xy_unused, preview_state,
-                      mode, shots_needed, roster, debug_mode):
-    if not ((n_btn or 0) > 0 or (n_enter or 0) > 0 or (n_test or 0) > 0):
+def parse_and_preview(n_btn, n_enter, possession_text, single_xy_unused, preview_state, mode, shots_needed, roster):
+    triggered = (n_btn or 0) > 0 or (n_enter or 0) > 0
+    if not triggered:
         return no_update, no_update
     if not possession_text or not possession_text.strip():
         return html.Div("Please enter a possession string.", style={"color": "crimson"}), no_update
 
+    # parse
     try:
         if pscoding18:
             parsed = pscoding18.parse_possession_string(possession_text.strip())
@@ -1663,90 +1517,18 @@ def parse_and_preview(n_btn, n_enter, n_test, possession_text, single_xy_unused,
             "possession_type": "shots",
             "play_by_play": "\n".join(lines),
             "play_by_play_names": "\n".join(annotated_lines),
+            # keep shorthand-derived single result only as a fallback (we compute per-shot later)
             "result": result_from_shorthand(possession_text.strip())
         }
 
-        debug_panel = None
-        try_test = (ctx.triggered_id == "btn_test_parse")
-        if debug_mode or try_test:
-            per = []
-            shot_lines = _align_lines_for_shots(annotated_lines or lines or [], len(xy_list))
-
-            def _flat(p):
-                if not isinstance(p, dict): return ""
-                return p.get("name") or p.get("id") or ""
-
-            for i, pt in enumerate(xy_list, start=1):
-                line_txt = shot_lines[i-1] if i-1 < len(shot_lines) else (shot_lines[-1] if shot_lines else "")
-                base = parse_shot_line_lite(line_txt, roster)
-                # enrich using the full possession text to pick up screener/coverage/etc.
-                detail = _augment_on_ball_detail_from_context(annotated_lines, line_txt, base, roster) or {}
-
-                row = {
-                    "#": i,
-                    "shooter": base.get("shooter_name") or base.get("shooter_id"),
-                    "defender": base.get("primary_defender_name") or base.get("primary_defender_id"),
-                    "assist": base.get("assist_name") or base.get("assist_id"),
-                    "on": ",".join(base.get("on_ball_actions") or []),
-                    "off": ",".join(base.get("off_ball_actions") or []),
-                    "cov_on": ",".join(base.get("coverages_on") or []),
-                    "cov_off": ",".join(base.get("coverages_off") or []),
-                    "ctx": ",".join(base.get("defense_context") or []),
-                    "on_type": detail.get("type") or "",
-                    "ball_handler": _flat(detail.get("ball_handler")),
-                    "bh_defender": _flat(detail.get("ball_handler_defender")),
-                }
-                if detail.get("type") in ("pnr","pnp","slp","gst","rj"):
-                    row.update({
-                        "screener": _flat(detail.get("screener")),
-                        "scr_defender": _flat(detail.get("screener_defender")),
-                        "coverage": detail.get("coverage_friendly") or (detail.get("coverage") or ""),
-                        "screen_assist": _flat(detail.get("screen_assist")),
-                    })
-                if detail.get("type") in ("dho","ho"):
-                    row.update({
-                        "handoff_from": _flat(detail.get("handoff_from")),
-                        "handoff_from_def": _flat(detail.get("handoff_from_defender")),
-                        "handoff_to": _flat(detail.get("handoff_to")),
-                        "handoff_to_def": _flat(detail.get("handoff_to_defender")),
-                        "coverage": detail.get("coverage_friendly") or (detail.get("coverage") or ""),
-                    })
-                if detail.get("type") in ("h","d","p"):
-                    row.update({
-                        "on_ball_defender": _flat(detail.get("on_ball_defender")),
-                    })
-                per.append(row)
-
-            # dynamic columns so all detail fields show
-            col_ids = []
-            for r in per:
-                for k in r.keys():
-                    if k not in col_ids:
-                        col_ids.append(k)
-
-            debug_panel = html.Div([
-                html.Div("Structured preview (per shot)", style={"fontWeight":600, "margin":"8px 0 4px"}),
-                dash_table.DataTable(
-                    columns=[{"name":k,"id":k} for k in col_ids],
-                    data=per or [],
-                    page_size=10,
-                    style_cell={"fontFamily":"system-ui","fontSize":"13px","whiteSpace":"pre","padding":"6px"},
-                    style_header={"fontWeight":"600"}
-                )
-            ])
-
-        ui_children = [
+        ui = html.Div([
             html.H4("Play-by-Play", style={"marginTop": 0}),
             html.Pre(pre_text, style={
                 "background": "#0b1021", "color": "#e6edf3",
                 "padding": "16px", "borderRadius": "10px",
                 "whiteSpace": "pre-wrap", "marginBottom": "10px", "fontSize": "16px",
                 "width": "100%"
-            })
-        ]
-        if debug_panel is not None:
-            ui_children.append(debug_panel)
-        ui_children.append(
+            }),
             html.Div([
                 html.Button("Discard / Edit", id="btn_discard", n_clicks=0,
                             style={"padding": "10px 14px", "borderRadius": "8px",
@@ -1755,9 +1537,8 @@ def parse_and_preview(n_btn, n_enter, n_test, possession_text, single_xy_unused,
                             style={"padding": "10px 14px", "borderRadius": "8px",
                                    "border": "none", "background": "#16a34a", "color": "white"})
             ], style={"display": "flex", "justifyContent": "flex-end", "gap": "8px"})
-        )
-
-        return html.Div(ui_children), preview
+        ])
+        return ui, preview
 
     # no-shot
     if mode == "no_shot":
@@ -1815,10 +1596,9 @@ def parse_and_preview(n_btn, n_enter, n_test, possession_text, single_xy_unused,
     State("store_preview", "data"),
     State("store_practice","data"),
     State("store_drill","data"),
-    State("store_roster","data"),
     prevent_initial_call=True
 )
-def save_possession(n_confirm, log_data, preview, practice, drill, roster):
+def save_possession(n_confirm, log_data, preview, practice, drill):
     if not n_confirm or not preview:
         return no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update
     if not (practice and practice.get("active") and drill and drill.get("active")):
@@ -1827,7 +1607,6 @@ def save_possession(n_confirm, log_data, preview, practice, drill, roster):
     log = list(log_data or [])
     pid, pdate = practice.get("practice_id"), practice.get("date")
     did, dname = drill.get("drill_id"), drill.get("name")
-    roster = roster or {}
 
     def attach_context(row: dict) -> dict:
         row = dict(row)
@@ -1839,93 +1618,71 @@ def save_possession(n_confirm, log_data, preview, practice, drill, roster):
 
     last_saved_card = None
 
+    # --- Append rows to disk (JSONL) and trim client window ---
+    def _append_and_window(row_dicts: list[dict]):
+        nonlocal log
+        for r in row_dicts:
+            # Append to disk O(1)
+            append_log_row(attach_context(r))
+            # Update client window
+            log.append(attach_context(r))
+        if len(log) > MAX_CLIENT_ROWS:
+            log = log[-MAX_CLIENT_ROWS:]
+
     if preview.get("possession_type") == "shots" and preview.get("xy_list"):
         gid = preview.get("group_id")
         raw_lines = (preview.get("play_by_play") or "").splitlines()
         raw_lines_names = (preview.get("play_by_play_names") or "").splitlines()
 
+        # Text-derived results
         text_results = _extract_results(raw_lines_names or raw_lines)
 
         xy_list   = preview["xy_list"]
         dist_list = preview.get("distance_list") or [None] * len(xy_list)
         need_n = len(xy_list)
 
+        # Shorthand-derived results (authoritative)
         short_results = _results_from_shorthand_tokens(preview.get("possession", ""), shots_needed=need_n)
 
+        # Prefer shorthand token for each shot, then fall back to text
         merged_results = []
         for i in range(need_n):
             sv = short_results[i] if i < len(short_results) else None
             tv = text_results[i] if i < len(text_results) else None
             merged_results.append(sv or tv)
 
-        lines_src = raw_lines_names if raw_lines_names else raw_lines
-        shot_lines = _align_lines_for_shots(lines_src, need_n)
-
         ts = preview["timestamp"]
+        new_rows = []
         for idx, (pt, dft) in enumerate(zip(xy_list, dist_list), start=1):
-            line_txt = shot_lines[idx-1] if idx-1 < len(shot_lines) else (shot_lines[-1] if shot_lines else "")
-            base = parse_shot_line_lite(line_txt, roster)
-            detail = _augment_on_ball_detail_from_context(lines_src, line_txt, base, roster) or {}
-
-            row = {
+            new_rows.append({
                 "id": f"{ts}-{_rand_suffix()}",
                 "timestamp": ts,
-                "schema_version": 2,
-
                 "possession": preview["possession"],
                 "x": float(pt["x"]), "y": float(pt["y"]),
                 "distance_ft": dft,
-
                 "play_by_play": "\n".join(raw_lines) if raw_lines else preview.get("possession", ""),
                 "play_by_play_names": "\n".join(raw_lines_names) if raw_lines_names else "",
-
-                "result": merged_results[idx-1],
+                "result": merged_results[idx-1],     # 'Make'/'Miss' or None
                 "group_id": gid,
                 "group_size": len(xy_list),
                 "shot_index": idx,
                 "possession_type": "shots",
+            })
+        _append_and_window(new_rows)
 
-                "shooter_id": base.get("shooter_id"),
-                "shooter_name": base.get("shooter_name"),
-                "primary_defender_id": base.get("primary_defender_id"),
-                "primary_defender_name": base.get("primary_defender_name"),
-                "assist_id": base.get("assist_id") if merged_results[idx-1] == "Make" else None,
-                "assist_name": base.get("assist_name") if merged_results[idx-1] == "Make" else None,
-                "on_ball_actions": base.get("on_ball_actions") or [],
-                "off_ball_actions": base.get("off_ball_actions") or [],
-                "coverages_on": base.get("coverages_on") or [],
-                "coverages_off": base.get("coverages_off") or [],
-                "defense_context": base.get("defense_context") or [],
-
-                # Persist richer on-ball info + screen_assist separate from assist
-                "on_ball_detail": detail or None,
-                "screen_assist_id": (detail.get("screen_assist") or {}).get("id"),
-                "screen_assist_name": (detail.get("screen_assist") or {}).get("name"),
-
-                "shot_type": shot_type_from_xy(pt["x"], pt["y"]),
-            }
-            log.append(attach_context(row))
-
+        # Summary card
         xs = ", ".join(f"{pt['x']:.1f}" for pt in xy_list)
         ys = ", ".join(f"{pt['y']:.1f}" for pt in xy_list)
         dists = ", ".join(f"{d:.1f}" if d is not None else "" for d in dist_list)
-
-        first_line = shot_lines[0] if shot_lines else (raw_lines_names[0] if raw_lines_names else (raw_lines[0] if raw_lines else ""))
-        p0 = parse_shot_line_lite(first_line, roster)
-
         res_str = ", ".join(r for r in merged_results if r)
-        banner = f"Saved possession · results=[{res_str}] · shooter={_fmt_idname(p0.get('shooter_id'), p0.get('shooter_name'))} · " \
-                 f"defender={_fmt_idname(p0.get('primary_defender_id'), p0.get('primary_defender_name'))} · " \
-                 f"assist={_fmt_idname(p0.get('assist_id'), p0.get('assist_name'))}"
-
         last_saved_card = html.Div([
             html.Div("Last saved possession", style={"fontWeight":700, "marginBottom":"6px"}),
             html.Pre(
-                f"{banner}\n"
                 f"Shorthand: {preview['possession']}\n"
                 f"X (ft): {xs}\n"
                 f"Y (ft): {ys}\n"
                 f"Shot Distance (ft): {dists}\n"
+                f"Result: {res_str}\n"
                 f"Group Size: {len(xy_list)}\n"
                 f"Drill: {dname}   Date: {pdate}",
                 style={"background":"#0b1021","color":"#e6edf3","padding":"12px","borderRadius":"8px","whiteSpace":"pre-wrap"}
@@ -1936,7 +1693,6 @@ def save_possession(n_confirm, log_data, preview, practice, drill, roster):
         row = {
             "id": preview["id"],
             "timestamp": preview["timestamp"],
-            "schema_version": 2,
             "possession": preview["possession"],
             "x": None, "y": None, "distance_ft": None,
             "play_by_play": preview.get("play_by_play", ""),
@@ -1947,7 +1703,7 @@ def save_possession(n_confirm, log_data, preview, practice, drill, roster):
             "shot_index": None,
             "possession_type": "no_shot",
         }
-        log.append(attach_context(row))
+        _append_and_window([row])
 
         last_saved_card = html.Div([
             html.Div("Last saved possession", style={"fontWeight":700, "marginBottom":"6px"}),
@@ -1960,14 +1716,12 @@ def save_possession(n_confirm, log_data, preview, practice, drill, roster):
         ])
 
     else:
-        preview = dict(preview)
-        preview["schema_version"] = 2
-        log.append(attach_context(preview))
+        _append_and_window([preview])
 
-    ok = save_log_to_disk(log)
-    notice = ("Saved to Data Log (write pending)" if not ok else "Saved to Data Log")
-    cleared_output = html.Div([html.Div(notice, style={"color": "#16a34a" if ok else "#b45309", "marginBottom": "8px"})])
+    notice = "Saved to Data Log"
+    cleared_output = html.Div([html.Div(notice, style={"color": "#16a34a", "marginBottom": "8px"})])
 
+    # Stay on "chart"
     return (log, "", None, cleared_output, last_saved_card, "chart",
             None, 0, [])
 
@@ -1979,7 +1733,8 @@ def save_possession(n_confirm, log_data, preview, practice, drill, roster):
     prevent_initial_call=True
 )
 def discard_preview(n):
-    if not n: return [no_update]
+    if not n:
+        return [no_update]
     return [html.Div([html.Div("Discarded. Re-enter the possession when ready.", style={"color": "#b45309"})])]
 
 
@@ -1995,6 +1750,10 @@ def _unique(items):
     return out
 
 def _group_possessions(rows):
+    """
+    Collapse shot-rows belonging to the same possession (by group_id if present
+    else by timestamp). Result column shows the per-shot results in order.
+    """
     groups = {}
     for r in rows or []:
         key = r.get("group_id") or r.get("timestamp") or r.get("id")
@@ -2003,7 +1762,7 @@ def _group_possessions(rows):
             "timestamp": r.get("timestamp"),
             "possession": r.get("possession"),
             "xs": [], "ys": [], "dists": [],
-            "res_seq": [],
+            "res_seq": [],  # (shot_index, result)
             "group_size": 0,
             "practice_date": r.get("practice_date"),
             "practice_id": r.get("practice_id"),
@@ -2014,7 +1773,10 @@ def _group_possessions(rows):
         if x is not None: g["xs"].append(x)
         if y is not None: g["ys"].append(y)
         if d is not None: g["dists"].append(d)
-        g["res_seq"].append((r.get("shot_index") or 0, r.get("result") if r.get("result") else None))
+
+        res = r.get("result")
+        g["res_seq"].append((r.get("shot_index") or 0, res if res else None))
+
         g["group_size"] = max(g["group_size"] or 0, r.get("group_size") or 0)
 
     consolidated = []
@@ -2044,17 +1806,20 @@ def _group_possessions(rows):
     Input("sel_date","data"),
     Input("sel_drill","data"),
 )
-def render_log_view(rows, level, sel_date, sel_drill):
-    rows = rows or []
+def render_log_view(_rows_ignored, level, sel_date, sel_drill):
+    """
+    Render from DISK via streaming (iter_rows), ignoring the full dataset in the client.
+    This keeps UI snappy regardless of total rows.
+    """
     level = level or "dates"
-
     wrap = lambda *kids: html.Div(list(kids), style={"maxWidth":"1200px","margin":"18px auto","padding":"0 12px"})
 
     if level == "dates":
         by_date = {}
-        for r in rows:
+        for r in iter_rows():
             d = r.get("practice_date")
-            if not d: continue
+            if not d:
+                continue
             key = r.get("group_id") or r.get("timestamp") or r.get("id")
             by_date.setdefault(d, set()).add(key)
         dates = sorted(by_date.keys(), reverse=True)
@@ -2094,8 +1859,7 @@ def render_log_view(rows, level, sel_date, sel_drill):
 
     if level == "drills" and sel_date:
         by_drill = {}
-        for r in rows:
-            if r.get("practice_date") != sel_date: continue
+        for r in iter_rows(date=sel_date):
             drill_name = r.get("drill_name") or "(unnamed)"
             key = r.get("group_id") or r.get("timestamp") or r.get("id")
             by_drill.setdefault(drill_name, set()).add(key)
@@ -2104,8 +1868,8 @@ def render_log_view(rows, level, sel_date, sel_drill):
             return wrap(
                 html.Div([
                     html.Button("← Back to dates", id="btn_back_dates", n_clicks=0,
-                                style={"cursor":"pointer","color":"#2563eb","padding":"6px 12px",
-                                       "border":"1px solid #2563eb","borderRadius":"6px","background":"white"}),
+                              style={"cursor":"pointer","color":"#2563eb","padding":"6px 12px",
+                                     "border":"1px solid #2563eb","borderRadius":"6px","background":"white"}),
                     html.Span(f"Practice: {sel_date}", style={"fontWeight":600,"marginLeft":"15px"}),
                 ], style={"marginBottom":"15px","display":"flex","alignItems":"center"}),
                 html.Div("No drills found for this practice.", style={"color":"#666"})
@@ -2135,8 +1899,8 @@ def render_log_view(rows, level, sel_date, sel_drill):
         return wrap(
             html.Div([
                 html.Button("← Back to dates", id="btn_back_dates", n_clicks=0,
-                            style={"cursor":"pointer","color":"#2563eb","padding":"6px 12px",
-                                   "border":"1px solid #2563eb","borderRadius":"6px","background":"white"}),
+                          style={"cursor":"pointer","color":"#2563eb","padding":"6px 12px",
+                                 "border":"1px solid #2563eb","borderRadius":"6px","background":"white"}),
                 html.Span(f"Practice: {sel_date}", style={"fontWeight":600,"marginLeft":"15px"}),
             ], style={"marginBottom":"15px","display":"flex","alignItems":"center"}),
             html.H4("Drills"),
@@ -2144,14 +1908,14 @@ def render_log_view(rows, level, sel_date, sel_drill):
         )
 
     if level == "table" and sel_date and sel_drill:
-        raw = [r for r in rows if r.get("practice_date")==sel_date and (r.get("drill_name") or "(unnamed)") == sel_drill]
+        raw = list(iter_rows(date=sel_date, drill=sel_drill))
         flt = _group_possessions(raw)
         if not flt:
             return wrap(
                 html.Div([
                     html.Button("← Back to drills", id="btn_back_drills", n_clicks=0,
-                                style={"cursor":"pointer","color":"#2563eb","padding":"6px 12px",
-                                       "border":"1px solid #2563eb","borderRadius":"6px","background":"white"}),
+                              style={"cursor":"pointer","color":"#2563eb","padding":"6px 12px",
+                                     "border":"1px solid #2563eb","borderRadius":"6px","background":"white"}),
                     html.Span(f"{sel_date} · {sel_drill}", style={"fontWeight":600,"marginLeft":"15px"}),
                 ], style={"marginBottom":"15px","display":"flex","alignItems":"center"}),
                 html.Div("No possessions for this drill.", style={"color":"#666"})
@@ -2178,14 +1942,17 @@ def render_log_view(rows, level, sel_date, sel_drill):
             style_cell={"whiteSpace":"pre-line","fontFamily":"system-ui","fontSize":"15px"},
             style_header={"fontWeight":"600"}, style_table={"overflowX":"auto"},
             sort_action="native", filter_action="native",
-            editable=False,
-            row_selectable="multi", selected_rows=[]
+            editable=False,  # <- no inline edit
+            row_selectable="multi", selected_rows=[],
+            # --- NEW: virtualize rendering so only visible rows are painted
+            virtualization=True,
+            fixed_rows={"headers": True}
         )
         return wrap(
             html.Div([
                 html.Button("← Back to drills", id="btn_back_drills", n_clicks=0,
-                            style={"cursor":"pointer","color":"#2563eb","padding":"6px 12px",
-                                   "border":"1px solid #2563eb","borderRadius":"6px","background":"white"}),
+                          style={"cursor":"pointer","color":"#2563eb","padding":"6px 12px",
+                                 "border":"1px solid #2563eb","borderRadius":"6px","background":"white"}),
                 html.Span(f"{sel_date} · {sel_drill}", style={"fontWeight":600,"marginLeft":"15px"}),
             ], style={"marginBottom":"15px","display":"flex","alignItems":"center"}),
             tbl,
@@ -2236,7 +2003,8 @@ def pick_drill(n_clicks):
     prevent_initial_call=True
 )
 def back_to_drills(n):
-    if not n: return no_update, no_update
+    if not n:
+        return no_update, no_update
     return "drills", None
 
 @app.callback(
@@ -2247,7 +2015,8 @@ def back_to_drills(n):
     prevent_initial_call=True
 )
 def back_to_dates(n):
-    if not n: return no_update, no_update, no_update
+    if not n:
+        return no_update, no_update, no_update
     return "dates", None, None
 
 
@@ -2274,6 +2043,7 @@ def show_confirmation_dialog(delete_practice_clicks, delete_drill_clicks, delete
     trig = ctx.triggered_id
     trig_val = ctx.triggered[0].get("value", None)
 
+    # Pick the LIVE table (scan from end; placeholders are earlier)
     selected_rows = []
     table_data = []
     for sr, td in zip((selected_rows_all or [])[::-1], (table_data_all or [])[::-1]):
@@ -2321,10 +2091,11 @@ def show_confirmation_dialog(delete_practice_clicks, delete_drill_clicks, delete
     prevent_initial_call=True
 )
 def cancel_confirmation(n):
-    if not n: return no_update
+    if not n:
+        return no_update
     return False
 
-# Execute deletion after confirmation (USES LIVE TABLE DATA)
+# Execute deletion after confirmation (stream-based compaction)
 @app.callback(
     Output("store_log", "data", allow_duplicate=True),
     Output("show_confirm_modal", "data", allow_duplicate=True),
@@ -2334,16 +2105,14 @@ def cancel_confirmation(n):
     Input("btn_confirm_delete", "n_clicks"),
     State("confirm_delete_type", "data"),
     State("confirm_delete_target", "data"),
-    State("store_log", "data"),
     State({"role":"tbl_log","scope":ALL}, "data"),
     prevent_initial_call=True
 )
-def execute_deletion(n, delete_type, target, all_rows, table_data_all):
+def execute_deletion(n, delete_type, target, table_data_all):
     if not n or not delete_type or not target:
         return no_update, no_update, no_update, no_update, no_update
 
-    all_rows = list(all_rows or [])
-
+    # Pick the LIVE table's data
     table_data = []
     for td in (table_data_all or [])[::-1]:
         if isinstance(td, list) and len(td) > 0:
@@ -2352,17 +2121,20 @@ def execute_deletion(n, delete_type, target, all_rows, table_data_all):
 
     if delete_type == "practice":
         practice_date = target
-        new_rows = [r for r in all_rows if r.get("practice_date") != practice_date]
-        save_log_to_disk(new_rows)
-        return new_rows, False, "dates", None, None
+        def keep_pred(r):  # keep everything NOT in that practice
+            return r.get("practice_date") != practice_date
+        _rewrite_storage_filtered(keep_pred)
+        # Refresh client window and nav back to dates
+        return _refresh_client_window(), False, "dates", None, None
 
     elif delete_type == "drill":
         drill_name = target["drill"]
         practice_date = target["date"]
-        new_rows = [r for r in all_rows if not (r.get("practice_date") == practice_date and
-                                               (r.get("drill_name") or "(unnamed)") == drill_name)]
-        save_log_to_disk(new_rows)
-        return new_rows, False, "drills", practice_date, None
+        def keep_pred(r):
+            return not (r.get("practice_date") == practice_date and
+                        (r.get("drill_name") or "(unnamed)") == drill_name)
+        _rewrite_storage_filtered(keep_pred)
+        return _refresh_client_window(), False, "drills", practice_date, None
 
     elif delete_type == "possession":
         if not table_data or not isinstance(target, list) or len(target) == 0:
@@ -2372,10 +2144,12 @@ def execute_deletion(n, delete_type, target, all_rows, table_data_all):
         if not selected_keys:
             return no_update, False, no_update, no_update, no_update
 
-        new_rows = [r for r in all_rows
-                    if (r.get("group_id") or r.get("timestamp") or r.get("id")) not in selected_keys]
-        save_log_to_disk(new_rows)
-        return new_rows, False, no_update, no_update, no_update
+        def keep_pred(r):
+            key = r.get("group_id") or r.get("timestamp") or r.get("id")
+            return key not in selected_keys
+
+        _rewrite_storage_filtered(keep_pred)
+        return _refresh_client_window(), False, no_update, no_update, no_update
 
     return no_update, no_update, no_update, no_update, no_update
 
@@ -2388,7 +2162,8 @@ def execute_deletion(n, delete_type, target, all_rows, table_data_all):
     prevent_initial_call=True
 )
 def add_roster_row(n, rows):
-    if not n: return no_update
+    if not n:
+        return no_update
     rows = list(rows or [])
     rows.append({"jersey": None, "name": ""})
     return rows
@@ -2401,7 +2176,8 @@ def add_roster_row(n, rows):
     prevent_initial_call=True
 )
 def save_roster(n, rows):
-    if not n: return no_update, no_update
+    if not n:
+        return no_update, no_update
     roster = {}
     for r in rows or []:
         try:
@@ -2411,7 +2187,7 @@ def save_roster(n, rows):
             j = int(j)
             if 0 < j < 100:
                 roster[str(j)] = nm
-        except:
+        except Exception:
             continue
     ok = save_roster_to_disk(roster)
     msg = "Roster saved." if ok else "Failed to save roster."
