@@ -307,19 +307,83 @@ def _robust_load_json(path, retries=15, wait=0.03):
 def _jsonl_path() -> str:
     return DATA_PATH_JSONL
 
+def _json_safe_row(r: dict):
+    out = dict(r)
+    out["x"] = _coerce_float(out.get("x"))
+    out["y"] = _coerce_float(out.get("y"))
+    if out["x"] is not None:
+        out["x"] = min(max(0.0, out["x"]), 50.0)
+    if out["y"] is not None:
+        out["y"] = min(max(0.0, out["y"]), 47.0)
+    out["distance_ft"] = _coerce_float(out.get("distance_ft"))
+    for key in ("group_size", "shot_index"):
+        if out.get(key) is not None:
+            try:
+                out[key] = int(out[key])
+            except:
+                out[key] = None
+    for k in ("group_id", "possession_type", "practice_id", "drill_id", "practice_date", "drill_name"):
+        if not out.get(k):
+            out[k] = None
+    if "play_by_play_names" not in out:
+        out["play_by_play_names"] = ""
+    # No 'shooter' field anymore — ensure it's dropped if present in legacy data
+    out.pop("shooter", None)
+    return out
+
+# ---- FIX: Keep legacy JSON array (possessions.json) in sync for vz_mk16 ----
+def _mirror_append_to_legacy_json(row: dict) -> bool:
+    """
+    Ensure the legacy JSON array file (DATA_PATH) is updated so the viz
+    (which reads possessions.json) immediately sees new rows.
+    """
+    try:
+        norm = _json_safe_row(_normalize_row(row))
+        # Load current array (or start fresh)
+        current = []
+        if os.path.exists(DATA_PATH) and DATA_PATH.lower().endswith(".json"):
+            data = _robust_load_json(DATA_PATH) or []
+            if isinstance(data, dict) and "rows" in data:
+                data = data["rows"]
+            if isinstance(data, list):
+                current = [ _normalize_row(r) for r in data ]
+        # Deduplicate by id/timestamp
+        seen = set()
+        out = []
+        for r in current:
+            k = (r.get("id") or r.get("timestamp"))
+            if not k or k in seen:
+                continue
+            seen.add(k); out.append(_json_safe_row(r))
+        k_new = (norm.get("id") or norm.get("timestamp"))
+        if k_new not in seen:
+            out.append(norm)
+        return _atomic_write_json(out, DATA_PATH)
+    except Exception as e:
+        print(f"[mirror legacy json] {e}")
+        return False
+
 def append_log_row(row: dict) -> bool:
     """
     Append a single possession row as JSONL (O(1) write).
     Keeps writes fast and avoids rewriting the entire dataset.
+
+    FIX: Also mirror to the legacy JSON array file so vz_mk16 (which reads
+    possessions.json) reflects new entries immediately.
     """
+    ok_jsonl = False
     try:
         os.makedirs(os.path.dirname(_jsonl_path()) or ".", exist_ok=True)
         with open(_jsonl_path(), "a", encoding="utf-8") as f:
             f.write(json.dumps(_json_safe_row(row), ensure_ascii=False) + "\n")
-        return True
+        ok_jsonl = True
     except Exception as e:
         print(f"[append_log_row] {e}")
-        return False
+        ok_jsonl = False
+
+    # Mirror to JSON array (best-effort; keep app usable even if this fails)
+    _mirror_append_to_legacy_json(row)
+    return ok_jsonl
 
 def _jsonl_tail(n: int) -> list[dict]:
     """
@@ -428,30 +492,6 @@ def load_log_from_disk():
             continue
         seen.add(k)
         out.append(r)
-    return out
-
-def _json_safe_row(r: dict):
-    out = dict(r)
-    out["x"] = _coerce_float(out.get("x"))
-    out["y"] = _coerce_float(out.get("y"))
-    if out["x"] is not None:
-        out["x"] = min(max(0.0, out["x"]), 50.0)
-    if out["y"] is not None:
-        out["y"] = min(max(0.0, out["y"]), 47.0)
-    out["distance_ft"] = _coerce_float(out.get("distance_ft"))
-    for key in ("group_size", "shot_index"):
-        if out.get(key) is not None:
-            try:
-                out[key] = int(out[key])
-            except:
-                out[key] = None
-    for k in ("group_id", "possession_type", "practice_id", "drill_id", "practice_date", "drill_name"):
-        if not out.get(k):
-            out[k] = None
-    if "play_by_play_names" not in out:
-        out["play_by_play_names"] = ""
-    # No 'shooter' field anymore — ensure it's dropped if present in legacy data
-    out.pop("shooter", None)
     return out
 
 def save_log_to_disk(rows):
@@ -1622,7 +1662,7 @@ def save_possession(n_confirm, log_data, preview, practice, drill):
     def _append_and_window(row_dicts: list[dict]):
         nonlocal log
         for r in row_dicts:
-            # Append to disk O(1)
+            # Append to disk O(1) and mirror JSON
             append_log_row(attach_context(r))
             # Update client window
             log.append(attach_context(r))

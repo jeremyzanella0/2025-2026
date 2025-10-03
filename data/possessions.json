@@ -55,24 +55,5 @@
     "practice_date": "2025-09-29",
     "drill_id": "practice-2025-09-29__drill-3v3-ball-screens--njf",
     "drill_name": "3v3 ball screens"
-  },
-  {
-    "id": "2025-10-03 12:11:45.376624-1rf0",
-    "timestamp": "2025-10-03 12:11:45.376624",
-    "possession": "1/3 4/5++",
-    "x": 7.0,
-    "y": 21.5,
-    "distance_ft": 24.9,
-    "play_by_play": "Player 1 guarded by Player 3 passes to Player 4 guarded by Player 5\nPlayer 4 guarded by Player 5 makes the shot (assisted by Player 1)!",
-    "play_by_play_names": "Huss guarded by Boyd passes to Fontana guarded by Lusk\nFontana guarded by Lusk makes the shot (assisted by Huss)!",
-    "result": "Make",
-    "group_id": "group-20251003121145376712-x2z",
-    "group_size": 1,
-    "shot_index": 1,
-    "possession_type": "shots",
-    "practice_id": "practice-2025-10-03",
-    "practice_date": "2025-10-03",
-    "drill_id": "practice-2025-10-03__drill-5v5-stags--ycc",
-    "drill_name": "5v5 stags"
   }
 ]
